@@ -68,6 +68,48 @@ from hermes_cli.colors import Colors, color
 
 logger = logging.getLogger(__name__)
 
+_GATEWAY_NOFILE_SOFT_TARGET = 4096
+
+
+def _raise_gateway_nofile_soft_limit(
+    target: int = _GATEWAY_NOFILE_SOFT_TARGET,
+    *,
+    resource_module=None,
+) -> tuple[int | None, int | None]:
+    """Raise a low POSIX gateway ``RLIMIT_NOFILE`` soft limit, best-effort.
+
+    The gateway owns many concurrent SQLite, HTTP, browser, subprocess, and
+    messaging descriptors.  A launchd-inherited soft limit of 256 can be
+    exhausted by supported concurrency even while the system-wide file table
+    has ample headroom.  Never lower an existing limit, never change the hard
+    limit, and fail open on unsupported or denied platforms.
+
+    Returns ``(previous_soft, effective_soft)`` when the limit is readable,
+    otherwise ``(None, None)``.
+    """
+    if os.name != "posix" and resource_module is None:
+        return (None, None)
+    try:
+        if resource_module is None:
+            import resource as resource_module  # noqa: PLC0415
+
+        soft, hard = resource_module.getrlimit(resource_module.RLIMIT_NOFILE)
+        target_soft = max(soft, int(target))
+        infinity = getattr(resource_module, "RLIM_INFINITY", -1)
+        if hard != infinity:
+            target_soft = min(target_soft, hard)
+        if target_soft > soft:
+            try:
+                resource_module.setrlimit(
+                    resource_module.RLIMIT_NOFILE, (target_soft, hard)
+                )
+            except (OSError, ValueError, PermissionError):
+                return (soft, soft)
+        return (soft, target_soft)
+    except (ImportError, AttributeError, OSError, ValueError, PermissionError):
+        return (None, None)
+
+
 # =============================================================================
 # Process Management (for manual gateway runs)
 # =============================================================================
@@ -5139,6 +5181,11 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
     _guard_supervised_gateway_conflict(force=force)
     _guard_existing_gateway_process_conflict(replace=replace)
     sys.path.insert(0, str(PROJECT_ROOT))
+
+    # Raise only the gateway process's soft descriptor limit before importing
+    # the runtime and creating SQLite/HTTP/browser/messaging resources. This
+    # leaves the hard limit and unrelated processes untouched.
+    _raise_gateway_nofile_soft_limit()
 
     # Detached Windows gateway runs must ignore console-control broadcasts
     # from sibling CLI processes, but foreground `hermes gateway run` still
