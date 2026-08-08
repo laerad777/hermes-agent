@@ -100,6 +100,45 @@ def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
         assert kb.get_task(conn, child).status == "ready"
 
 
+def test_typed_review_task_with_completed_parent_rejects_dependency_block(
+    kanban_home: Path,
+) -> None:
+    """A review verdict is an output, not a lifecycle dependency wait.
+
+    Once every declared parent is complete, parking a typed review card as a
+    dependency would make ``recompute_ready`` promote it immediately and
+    respawn the same goal-mode review forever.
+    """
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="approved plan", assignee="planner")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (parent,))
+        assert kb.claim_task(conn, parent, claimer="planner") is not None
+        assert kb.complete_task(conn, parent, summary="plan complete")
+
+        child = kb.create_task(
+            conn,
+            title="adverse architecture review",
+            assignee="architect",
+            parents=[parent],
+            workflow_template_id="jerome-kanban-v1",
+            current_step_key="architect",
+            goal_mode=True,
+        )
+        assert kb.claim_task(conn, child, claimer="architect") is not None
+
+        with pytest.raises(kb.RoleCompletionContractError, match="review verdict"):
+            kb.block_task(
+                conn,
+                child,
+                reason="BLOCK: design mismatch",
+                kind="dependency",
+                expected_run_id=kb.get_task(conn, child).current_run_id,
+            )
+
+        assert kb.get_task(conn, child).status == "running"
+
+
 # ---------------------------------------------------------------------------
 # Completion resets loop memory
 # ---------------------------------------------------------------------------

@@ -173,6 +173,18 @@ def _run_ddgs_search_bounded(query: str, safe_limit: int) -> list[dict[str, Any]
         )
 
     worker_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_search_worker.py")
+    worker_argv = [sys.executable, worker_path]
+    try:
+        from hermes_cli.kanban_runtime_snapshot import (
+            sealed_python_argv,
+            snapshot_bootstrap_capability,
+        )
+
+        if snapshot_bootstrap_capability() is not None:
+            command, args = sealed_python_argv("plugins/web/ddgs/_search_worker.py")
+            worker_argv = [command, *args]
+    except ImportError:
+        pass
     # Platform-only spawn knobs — stdin/stdout/stderr must stay as explicit
     # keyword args on the Popen call so scripts/check_subprocess_stdin.py can
     # see them (TUI gateway inherits stdin; #14036).
@@ -185,7 +197,7 @@ def _run_ddgs_search_bounded(query: str, safe_limit: int) -> list[dict[str, Any]
         extra_kwargs["start_new_session"] = True
 
     proc = subprocess.Popen(
-        [sys.executable, worker_path],
+        worker_argv,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         # DEVNULL avoids the classic deadlock where a chatty child fills the

@@ -77,17 +77,19 @@ import os
 import re
 import random
 import secrets
+import signal
 import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import logging
 import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -4008,6 +4010,18 @@ def _end_run(
     if not row or not row["current_run_id"]:
         return None
     run_id = int(row["current_run_id"])
+    existing = conn.execute(
+        "SELECT metadata FROM task_runs WHERE id=?", (run_id,),
+    ).fetchone()
+    if existing and existing["metadata"]:
+        try:
+            merged_metadata = json.loads(existing["metadata"])
+        except (TypeError, json.JSONDecodeError):
+            merged_metadata = {}
+        if isinstance(merged_metadata, dict):
+            if metadata is not None:
+                merged_metadata.update(metadata)
+            metadata = merged_metadata
     conn.execute(
         """
         UPDATE task_runs
@@ -4028,7 +4042,7 @@ def _end_run(
             outcome,
             summary,
             error,
-            json.dumps(metadata, ensure_ascii=False) if metadata else None,
+            json.dumps(metadata, ensure_ascii=False) if metadata is not None else None,
             now,
             run_id,
         ),
@@ -4090,7 +4104,7 @@ def _synthesize_ended_run(
             task_id, profile, step_key,
             outcome, outcome,
             summary, error,
-            json.dumps(metadata, ensure_ascii=False) if metadata else None,
+            json.dumps(metadata, ensure_ascii=False) if metadata is not None else None,
             now, now,
         ),
     )
@@ -4132,11 +4146,11 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     """
     row = conn.execute(
         "SELECT kind FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
+        "WHERE task_id = ? AND kind IN ('blocked', 'review_blocked', 'unblocked') "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    return bool(row) and row["kind"] == "blocked"
+    return bool(row) and row["kind"] in {"blocked", "review_blocked"}
 
 
 def recompute_ready(
@@ -4847,6 +4861,37 @@ class RoleCompletionContractError(ValueError):
 _JEROME_WORKFLOW_TEMPLATE = "jerome-kanban-v1"
 _JEROME_WORKFLOW_MARKER = "WORKFLOW_CONTRACT: jerome-kanban-v1"
 _HEX_REVISION_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
+_IMMUTABLE_RUNTIME_LAUNCHER = r'''
+import os
+import runpy
+import sys
+
+object_root, manifest_sha256, cache_key, raw_bindings = sys.argv[1:5]
+worker_argv = sys.argv[5:]
+payload_root = os.path.join(object_root, "payload")
+sys.path[:] = [payload_root]
+from hermes_cli.kanban_runtime_snapshot import install_snapshot_bootstrap_capability, runtime_bindings_from_json, snapshot_runtime_sys_path, verify_published_snapshot, with_runtime_bindings
+spec = verify_published_snapshot(object_root, manifest_sha256, cache_key)
+spec = with_runtime_bindings(spec, runtime_bindings_from_json(raw_bindings))
+sys.path[:] = snapshot_runtime_sys_path(spec)
+install_snapshot_bootstrap_capability(spec)
+os.environ["HERMES_KANBAN_RUNTIME_ROOT"] = payload_root
+os.environ["HERMES_KANBAN_SNAPSHOT_CACHE_KEY"] = cache_key
+os.environ["PYTHONNOUSERSITE"] = "1"
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+for name in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONINSPECT"):
+    os.environ.pop(name, None)
+sys.argv = ["hermes", *worker_argv]
+runpy.run_module("hermes_cli.main", run_name="__main__", alter_sys=False)
+'''
+
+
+def _is_jerome_workflow_task(task: Task) -> bool:
+    """Recognize both immutable typed cards and the supported legacy marker."""
+    return (
+        task.workflow_template_id == _JEROME_WORKFLOW_TEMPLATE
+        or _JEROME_WORKFLOW_MARKER in (task.body or "")
+    )
 
 
 def _typed_verdict(summary: str, allowed: set[str]) -> Optional[str]:
@@ -4927,11 +4972,7 @@ def _validate_role_completion_contract(
     summary: Optional[str],
     metadata: Optional[dict],
 ) -> None:
-    typed = (
-        task.workflow_template_id == _JEROME_WORKFLOW_TEMPLATE
-        or _JEROME_WORKFLOW_MARKER in (task.body or "")
-    )
-    if not typed:
+    if not _is_jerome_workflow_task(task):
         return
     if task.status == "blocked":
         raise RoleCompletionContractError(
@@ -4955,9 +4996,15 @@ def _validate_role_completion_contract(
                 "Critic verdict must be exactly one OKAY; ITERATE/REJECT must block"
             )
     elif role in {"architect", "verifier"}:
-        if _typed_verdict(text, {"CLEAR", "WATCH", "BLOCK"}) not in {"CLEAR", "WATCH"}:
+        verdict = _typed_verdict(text, {"CLEAR", "WATCH", "BLOCK"})
+        allowed_verdicts = (
+            {"CLEAR", "WATCH", "BLOCK"}
+            if role == "architect"
+            else {"CLEAR", "WATCH"}
+        )
+        if verdict not in allowed_verdicts:
             raise RoleCompletionContractError(
-                f"{role} verdict must be exactly one CLEAR or WATCH"
+                f"{role} verdict must be exactly one of {sorted(allowed_verdicts)}"
             )
         if role == "verifier":
             reviewed = meta.get("reviewed_commit")
@@ -5061,14 +5108,25 @@ def complete_task(
     """
     now = int(time.time())
 
-    task_for_contract = get_task(conn, task_id)
-    if task_for_contract is None:
-        return False
-    _validate_role_completion_contract(
-        task_for_contract,
-        summary=summary if summary is not None else result,
-        metadata=metadata,
-    )
+    if metadata is not None:
+        if not isinstance(metadata, dict):
+            raise TypeError(
+                f"metadata must be an object/dict, got {type(metadata).__name__}"
+            )
+        try:
+            metadata_json = json.dumps(
+                metadata,
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            normalized_metadata = json.loads(metadata_json)
+        except (TypeError, ValueError) as exc:
+            raise TypeError("metadata must be a JSON-safe object/dict") from exc
+        if normalized_metadata != metadata:
+            raise TypeError("metadata must contain only JSON-safe object values")
+        metadata = normalized_metadata
+    _reject_reserved_run_metadata(metadata)
+
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -5100,12 +5158,46 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    review_blocked = False
+    canonical_receipt = summary if summary is not None else result
     with write_txn(conn):
+        task_for_contract = get_task(conn, task_id)
+        if task_for_contract is None:
+            return False
+        if _is_jerome_workflow_task(task_for_contract) and summary and result:
+            summary_verdict = _typed_verdict(
+                summary, {"OKAY", "ITERATE", "REJECT", "CLEAR", "WATCH", "BLOCK"}
+            )
+            result_verdict = _typed_verdict(
+                result, {"OKAY", "ITERATE", "REJECT", "CLEAR", "WATCH", "BLOCK"}
+            )
+            if summary_verdict != result_verdict:
+                raise RoleCompletionContractError(
+                    "conflicting typed workflow result and summary verdicts"
+                )
+        _validate_role_completion_contract(
+            task_for_contract,
+            summary=canonical_receipt,
+            metadata=metadata,
+        )
+        role = (
+            task_for_contract.current_step_key
+            or task_for_contract.assignee
+            or ""
+        ).strip().lower()
+        review_blocked = (
+            _is_jerome_workflow_task(task_for_contract)
+            and role == "architect"
+            and _typed_verdict(canonical_receipt or "", {"CLEAR", "WATCH", "BLOCK"})
+            == "BLOCK"
+        )
+        target_status = "blocked" if review_blocked else "done"
+        stored_result = canonical_receipt if review_blocked else result
         if expected_run_id is None:
             cur = conn.execute(
                 """
                 UPDATE tasks
-                   SET status       = 'done',
+                   SET status       = ?,
                        result       = ?,
                        completed_at = ?,
                        claim_lock   = NULL,
@@ -5116,13 +5208,13 @@ def complete_task(
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked')
                 """,
-                (result, now, task_id),
+                (target_status, stored_result, now, task_id),
             )
         else:
             cur = conn.execute(
                 """
                 UPDATE tasks
-                   SET status       = 'done',
+                   SET status       = ?,
                        result       = ?,
                        completed_at = ?,
                        claim_lock   = NULL,
@@ -5134,7 +5226,7 @@ def complete_task(
                    AND status IN ('running', 'ready', 'blocked')
                    AND current_run_id = ?
                 """,
-                (result, now, task_id, int(expected_run_id)),
+                (target_status, stored_result, now, task_id, int(expected_run_id)),
             )
         if cur.rowcount != 1:
             return False
@@ -5152,8 +5244,9 @@ def complete_task(
                 )
         run_id = _end_run(
             conn, task_id,
-            outcome="completed", status="done",
-            summary=summary if summary is not None else result,
+            outcome="review_blocked" if review_blocked else "completed",
+            status="blocked" if review_blocked else "done",
+            summary=canonical_receipt,
             metadata=metadata,
         )
         # If complete_task was called on a never-claimed task (ready or
@@ -5163,8 +5256,8 @@ def complete_task(
         if run_id is None and (summary or metadata or result):
             run_id = _synthesize_ended_run(
                 conn, task_id,
-                outcome="completed",
-                summary=summary if summary is not None else result,
+                outcome="review_blocked" if review_blocked else "completed",
+                summary=canonical_receipt,
                 metadata=metadata,
             )
         # Carry the handoff summary in the event payload so gateway
@@ -5177,6 +5270,8 @@ def complete_task(
             "result_len": len(result) if result else 0,
             "summary": ev_summary or None,
         }
+        if metadata is not None:
+            completed_payload["metadata"] = metadata
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
         # Carry artifact paths in the event payload so the gateway
@@ -5194,10 +5289,21 @@ def complete_task(
                 if cleaned_artifacts:
                     completed_payload["artifacts"] = cleaned_artifacts
         _append_event(
-            conn, task_id, "completed",
+            conn, task_id, "review_blocked" if review_blocked else "completed",
             completed_payload,
             run_id=run_id,
         )
+    if review_blocked:
+        _blocked_task = get_task(conn, task_id)
+        _fire_kanban_lifecycle_hook(
+            "kanban_task_blocked",
+            task_id,
+            board=get_current_board(),
+            assignee=_blocked_task.assignee if _blocked_task else None,
+            run_id=run_id,
+            reason=canonical_receipt,
+        )
+        return True
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
     # its own txn so the completion itself is already durable by the
@@ -5818,6 +5924,7 @@ def block_task(
     *,
     reason: Optional[str] = None,
     kind: Optional[str] = None,
+    metadata: Optional[dict] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
@@ -5851,8 +5958,33 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    _reject_reserved_run_metadata(metadata)
     recurrences = 0
     with write_txn(conn):
+        if kind == "dependency":
+            task = get_task(conn, task_id)
+            role = (
+                (task.current_step_key or task.assignee or "").strip().lower()
+                if task is not None
+                else ""
+            )
+            if (
+                task is not None
+                and _is_jerome_workflow_task(task)
+                and role in {"architect", "critic", "verifier"}
+            ):
+                unfinished_parent = conn.execute(
+                    "SELECT 1 FROM task_links l "
+                    "JOIN tasks p ON p.id = l.parent_id "
+                    "WHERE l.child_id = ? "
+                    "AND p.status NOT IN ('done', 'archived') LIMIT 1",
+                    (task_id,),
+                ).fetchone()
+                if unfinished_parent is None:
+                    raise RoleCompletionContractError(
+                        "typed review verdict is an output: complete the review card; "
+                        "dependency block requires an unfinished declared parent"
+                    )
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
             (task_id,),
@@ -7045,6 +7177,48 @@ class DispatchResult:
     actively preventing two dispatchers from racing on ``kanban.db``."""
 
 
+@dataclass(frozen=True)
+class SpawnedWorker:
+    """Structured spawn result for launch probes and custom spawners."""
+
+    pid: int
+    returncode: Optional[int] = None
+    log_path: Optional[Path] = None
+    pid_committed: bool = False
+
+
+@dataclass(frozen=True)
+class WorkerRuntimeSpec:
+    """Hermes CLI argv plus a sealed runtime selected for one worker."""
+
+    argv: list[str]
+    env: dict[str, str] = field(default_factory=dict)
+    snapshot: Optional[Any] = None
+    lease: Optional[Any] = None
+    pass_fds: tuple[int, ...] = ()
+
+
+class WorkerRuntimeMismatch(RuntimeError):
+    """The live worker imported Hermes from outside its approved revision."""
+
+
+class ReservedRunMetadataError(ValueError):
+    """Caller metadata attempted to write a system-owned run field."""
+
+
+_RESERVED_RUN_METADATA_KEYS = frozenset({"runtime_provenance"})
+
+
+def _reject_reserved_run_metadata(metadata: Optional[dict]) -> None:
+    if not metadata:
+        return
+    collisions = sorted(_RESERVED_RUN_METADATA_KEYS.intersection(metadata))
+    if collisions:
+        raise ReservedRunMetadataError(
+            f"run metadata keys are reserved for the system: {', '.join(collisions)}"
+        )
+
+
 # Bounded registry of recently-reaped worker child exits, populated by the
 # reap loop at the top of ``dispatch_once`` and consulted by
 # ``detect_crashed_workers`` to classify a dead-pid task.
@@ -7774,67 +7948,16 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
 
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
-            rate_limited_exit = False
-            if kind == "clean_exit":
-                # Worker subprocess returned 0 but its task is still
-                # ``running`` in the DB — it exited without calling
-                # ``kanban_complete`` / ``kanban_block``. Overwhelmingly the
-                # work itself succeeded and only the paperwork was skipped, so
-                # a retry usually completes; the corrective sentence below is
-                # surfaced to the retry worker via the prior-attempt error in
-                # ``build_worker_context`` (guidance approach from #61817).
-                protocol_violation = True
-                error_text = (
-                    "worker exited cleanly (rc=0) without calling "
-                    "kanban_complete or kanban_block — protocol violation. "
-                    "If the prior run already did the work, verify it and "
-                    "report the result via kanban_complete; a run that ends "
-                    "without a terminal kanban call counts as failed no "
-                    "matter what it did."
-                )
-                event_kind = "protocol_violation"
-                event_payload = {
-                    "pid": pid,
-                    "claimer": row["claim_lock"],
-                    "exit_code": code,
-                    # Durable marker for _protocol_violation_streak: _end_run
-                    # copies this payload into the run metadata, which is how
-                    # the violation-only retry budget is derived later.
-                    "protocol_violation": True,
-                }
-            elif kind == "rate_limited":
-                # Worker bailed because the provider rate-limited / exhausted
-                # quota (EX_TEMPFAIL sentinel). This is NOT a task failure —
-                # the task is fine, the account just hit a wall. Release it
-                # back to ``ready`` so the respawn guard defers it until the
-                # quota window clears, and crucially do NOT count a failure
-                # (skip ``_record_task_failure``) so a long quota window can't
-                # trip the circuit breaker and permanently block the card.
-                protocol_violation = False
-                rate_limited_exit = True
-                error_text = (
-                    f"pid {pid} exited rate-limited (quota wall) — "
-                    f"requeued without counting a failure"
-                )
-                event_kind = "rate_limited"
-                event_payload = {
-                    "pid": pid,
-                    "claimer": row["claim_lock"],
-                    "exit_code": code,
-                }
-            else:
-                protocol_violation = False
-                if kind == "nonzero_exit":
-                    error_text = f"pid {pid} exited with code {code}"
-                elif kind == "signaled":
-                    error_text = f"pid {pid} killed by signal {code}"
-                else:
-                    error_text = f"pid {pid} not alive"
-                event_kind = "crashed"
-                event_payload = {"pid": pid, "claimer": row["claim_lock"]}
-                if code is not None and kind != "unknown":
-                    event_payload["exit_kind"] = kind
-                    event_payload["exit_code"] = code
+            (
+                _run_outcome,
+                error_text,
+                event_kind,
+                event_payload,
+                protocol_violation,
+                rate_limited_exit,
+            ) = _worker_exit_record(
+                kind, code, pid=pid, claimer=row["claim_lock"],
+            )
 
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
@@ -7847,7 +7970,6 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 # Rate-limited requeues are a clean release, not a crash —
                 # record the run outcome as ``rate_limited`` so the board
                 # history doesn't show a phantom crash for a quota wall.
-                _run_outcome = "rate_limited" if rate_limited_exit else "crashed"
                 run_id = _end_run(
                     conn, row["id"],
                     outcome=_run_outcome, status=_run_outcome,
@@ -8163,6 +8285,190 @@ def _record_spawn_failure(
     )
 
 
+def _worker_log_tail(log_path: Optional[Path], *, limit: int = 2000) -> str:
+    """Read and redact a bounded worker-log suffix for durable diagnostics."""
+    if log_path is None:
+        return ""
+    try:
+        with open(log_path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - limit), os.SEEK_SET)
+            text = handle.read(limit).decode("utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+    from agent.redact import redact_sensitive_text
+
+    return redact_sensitive_text(text, force=True)
+
+
+def _classify_returncode(returncode: int) -> tuple[str, int]:
+    """Map ``Popen.returncode`` to the canonical worker exit taxonomy."""
+    code = int(returncode)
+    if code == 0:
+        return ("clean_exit", 0)
+    if code == KANBAN_RATE_LIMIT_EXIT_CODE:
+        return ("rate_limited", code)
+    if code < 0:
+        return ("signaled", abs(code))
+    return ("nonzero_exit", code)
+
+
+def _worker_exit_record(
+    kind: str,
+    code: Optional[int],
+    *,
+    pid: int,
+    claimer: Optional[str],
+    tail: str = "",
+) -> tuple[str, str, str, dict, bool, bool]:
+    """Return canonical outcome/error/event metadata for every exit observer."""
+    payload: dict[str, Any] = {"pid": int(pid), "claimer": claimer}
+    protocol_violation = False
+    rate_limited = False
+    if code is not None:
+        payload["exit_code"] = int(code)
+    if kind == "clean_exit":
+        protocol_violation = True
+        error = (
+            "worker exited cleanly (rc=0) without calling kanban_complete or "
+            "kanban_block — protocol violation. If the prior run already did "
+            "the work, verify it and report the result via kanban_complete; a "
+            "run that ends without a terminal kanban call counts as failed no "
+            "matter what it did."
+        )
+        event_kind = "protocol_violation"
+        payload["protocol_violation"] = True
+    elif kind == "rate_limited":
+        rate_limited = True
+        error = (
+            f"pid {pid} exited rate-limited (quota wall) — requeued without "
+            "counting a failure"
+        )
+        event_kind = "rate_limited"
+    elif kind == "nonzero_exit":
+        error = f"pid {pid} exited with code {code}"
+        event_kind = "crashed"
+        payload["exit_kind"] = kind
+    elif kind == "signaled":
+        error = f"pid {pid} killed by signal {code}"
+        event_kind = "crashed"
+        payload["exit_kind"] = kind
+    else:
+        error = f"pid {pid} not alive"
+        event_kind = "crashed"
+    if tail:
+        error = f"{error}: {tail}"
+    outcome = "rate_limited" if rate_limited else "crashed"
+    return outcome, error, event_kind, payload, protocol_violation, rate_limited
+
+
+def record_worker_exit(
+    task_id: str,
+    run_id: Optional[int],
+    pid: int,
+    returncode: int,
+    *,
+    log_path: Optional[Path] = None,
+    db_path: Optional[Path] = None,
+) -> bool:
+    """Promptly classify a detached child exit with a run/pid CAS guard."""
+    tail = _worker_log_tail(log_path)
+    kind, code = _classify_returncode(returncode)
+    with connect_closing(db_path=db_path) as exit_conn:
+        with write_txn(exit_conn):
+            row = exit_conn.execute(
+                "SELECT claim_lock FROM tasks WHERE id=? AND status='running' "
+                "AND current_run_id IS ? AND worker_pid=?",
+                (task_id, run_id, int(pid)),
+            ).fetchone()
+            if row is None:
+                return False
+            outcome, error, event_kind, payload, protocol_violation, rate_limited = (
+                _worker_exit_record(
+                    kind, code, pid=int(pid), claimer=row["claim_lock"], tail=tail,
+                )
+            )
+            cur = exit_conn.execute(
+                "UPDATE tasks SET status='ready', claim_lock=NULL, "
+                "claim_expires=NULL, worker_pid=NULL WHERE id=? "
+                "AND status='running' AND current_run_id IS ? AND worker_pid=?",
+                (task_id, run_id, int(pid)),
+            )
+            if cur.rowcount != 1:
+                return False
+            ended_run = _end_run(
+                exit_conn, task_id, outcome=outcome, status=outcome,
+                error=error[:500],
+                metadata=payload,
+            )
+            _append_event(
+                exit_conn, task_id, event_kind, payload,
+                run_id=ended_run,
+            )
+            exit_conn.execute(
+                "UPDATE tasks SET last_failure_error=? WHERE id=?",
+                (error[:500], task_id),
+            )
+        if protocol_violation:
+            streak = _protocol_violation_streak(exit_conn, task_id)
+            task = get_task(exit_conn, task_id)
+            limit = (
+                int(task.max_retries)
+                if task is not None and task.max_retries is not None
+                else _PROTOCOL_VIOLATION_FAILURE_LIMIT
+            )
+            if streak >= limit:
+                _record_task_failure(
+                    exit_conn, task_id, error, outcome="crashed",
+                    failure_limit=limit, force_trip=True,
+                    release_claim=False, end_run=False,
+                    event_payload_extra={
+                        "pid": int(pid), "protocol_violations": streak,
+                        "protocol_violation_limit": limit,
+                    },
+                )
+        elif not rate_limited:
+            _record_task_failure(
+                exit_conn, task_id, error,
+                outcome="crashed", release_claim=False, end_run=False,
+            )
+    return True
+
+
+def _watch_worker_exit(
+    proc: Any,
+    task_id: str,
+    run_id: Optional[int],
+    log_path: Path,
+    db_path: Path,
+    snapshot_lease: Optional[Any] = None,
+) -> None:
+    """Wait off-thread and promptly classify one detached worker exit.
+
+    The child can exit between ``Popen`` and the dispatcher's subsequent
+    ``_set_worker_pid`` transaction. Retry the CAS briefly so that race is
+    classified here instead of falling through to the next 60-second tick.
+    """
+    try:
+        returncode = int(proc.wait())
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if record_worker_exit(
+                task_id, run_id, int(proc.pid), returncode,
+                log_path=log_path, db_path=db_path,
+            ):
+                return
+            time.sleep(0.02)
+    except Exception:
+        _log.debug("kanban worker exit watcher failed", exc_info=True)
+    finally:
+        if snapshot_lease is not None:
+            from hermes_cli.kanban_runtime_snapshot import release_snapshot_lease
+
+            release_snapshot_lease(snapshot_lease)
+
+
 def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     """Record the spawned child's pid + emit a ``spawned`` event.
 
@@ -8182,6 +8488,481 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
                 (int(pid), run_id),
             )
         _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+
+
+class ReviewerAuthorityError(RuntimeError):
+    """A typed reviewer bootstrap failed closed before activation."""
+
+
+class ReviewerActivationStartFailed(ReviewerAuthorityError):
+    """PID was committed, but the child never completed READY+EOF."""
+
+
+_REVIEWER_ROLES = frozenset({"planner", "architect", "critic", "verifier"})
+_REVIEWER_HANDSHAKE_TIMEOUT = 10.0
+_REVIEWER_TERMINATE_GRACE = 2.0
+
+
+class HandshakeOwner:
+    """Single owner for a reviewer process until READY+EOF handoff."""
+
+    _TRANSITIONS = {
+        "CREATED": "CHILD_STARTED",
+        "CHILD_STARTED": "HELLO_ACCEPTED",
+        "HELLO_ACCEPTED": "PID_COMMITTED",
+        "PID_COMMITTED": "GRANT_SENT",
+        "GRANT_SENT": "READY",
+        "READY": "HANDED_OFF",
+    }
+
+    def __init__(self, proc: Any, descriptors: Sequence[int]):
+        self.proc = proc
+        self.descriptors = list(descriptors)
+        self.state = "CREATED"
+        self._closed = False
+
+    def advance(self, expected: str) -> None:
+        if self._TRANSITIONS.get(self.state) != expected:
+            raise ReviewerAuthorityError("bootstrap_protocol_violation")
+        self.state = expected
+
+    def close_descriptors(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for descriptor in self.descriptors:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+    def abort_and_reap(self) -> None:
+        if self.state == "HANDED_OFF":
+            return
+        self.state = "ABORTING"
+        self.close_descriptors()
+        if self.proc.poll() is not None:
+            try:
+                self.proc.wait(timeout=2)
+            except Exception:
+                pass
+            self.state = "REAPED"
+            return
+        terminate = (
+            self.proc.terminate
+            if _IS_WINDOWS
+            else lambda: os.killpg(self.proc.pid, signal.SIGTERM)
+        )
+        kill = (
+            self.proc.kill
+            if _IS_WINDOWS
+            else lambda: os.killpg(self.proc.pid, signal.SIGKILL)
+        )
+        try:
+            terminate()
+        except (OSError, ProcessLookupError):
+            pass
+        grace_deadline = time.monotonic() + _REVIEWER_TERMINATE_GRACE
+        while self.proc.poll() is None and time.monotonic() < grace_deadline:
+            time.sleep(0.01)
+        if self.proc.poll() is None:
+            try:
+                kill()
+            except (OSError, ProcessLookupError):
+                pass
+        try:
+            self.proc.wait(timeout=2)
+        except Exception:
+            pass
+        self.state = "REAPED"
+
+
+def _activation_start_failed(
+    conn: sqlite3.Connection, task: Task, pid: int, error: str,
+) -> None:
+    """Terminally close a PID-committed bootstrap without making it reusable."""
+    if task.current_run_id is None:
+        raise ReviewerAuthorityError("activation_start_failed_without_run")
+    run_id = int(task.current_run_id)
+    clean = str(error)[:500]
+    now = int(time.time())
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status='blocked', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, last_failure_error=? "
+            "WHERE id=? AND current_run_id=? AND worker_pid=?",
+            (clean, task.id, run_id, int(pid)),
+        )
+        conn.execute(
+            "UPDATE task_runs SET status='activation_start_failed', "
+            "outcome='activation_start_failed', error=?, ended_at=?, "
+            "claim_lock=NULL, claim_expires=NULL "
+            "WHERE id=? AND task_id=? AND worker_pid=? AND ended_at IS NULL",
+            (clean, now, run_id, task.id, int(pid)),
+        )
+        _append_event(
+            conn, task.id, "activation_start_failed",
+            {"pid": int(pid), "error": clean}, run_id=run_id,
+        )
+
+
+def _commit_reviewer_authority(
+    conn: sqlite3.Connection,
+    task: Task,
+    pid: int,
+    *,
+    parent_pid: int,
+) -> dict[str, Any]:
+    """Atomically bind a typed reviewer run to ``pid`` on ``conn``.
+
+    The caller owns the authoritative connection selected before claim.  This
+    function deliberately never resolves or reopens a database path.
+    """
+    role = (task.current_step_key or "").strip().lower()
+    if not _is_jerome_workflow_task(task) or role not in _REVIEWER_ROLES:
+        raise ReviewerAuthorityError("reviewer_authority_not_applicable")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        raise ReviewerAuthorityError("worker_pid_cas_failed")
+    if not isinstance(parent_pid, int) or isinstance(parent_pid, bool) or parent_pid <= 0:
+        raise ReviewerAuthorityError("grant_binding_mismatch")
+    if task.current_run_id is None or not task.claim_lock or task.claim_expires is None:
+        raise ReviewerAuthorityError("worker_pid_cas_failed")
+
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """
+            SELECT t.id, t.status, t.assignee, t.claim_lock, t.claim_expires,
+                   t.current_run_id, t.worker_pid, t.workflow_template_id,
+                   t.current_step_key, r.profile, r.status AS run_status,
+                   r.claim_lock AS run_claim_lock, r.claim_expires AS run_claim_expires,
+                   r.worker_pid AS run_worker_pid, r.ended_at
+              FROM tasks t JOIN task_runs r ON r.id=t.current_run_id
+             WHERE t.id=? AND t.current_run_id=? AND r.task_id=t.id
+            """,
+            (task.id, int(task.current_run_id)),
+        ).fetchone()
+        if row is None or any(
+            (
+                row["status"] != "running",
+                row["run_status"] != "running",
+                row["ended_at"] is not None,
+                row["assignee"] != task.assignee,
+                row["profile"] != task.assignee,
+                row["claim_lock"] != task.claim_lock,
+                row["run_claim_lock"] != task.claim_lock,
+                row["claim_expires"] != task.claim_expires,
+                row["run_claim_expires"] != task.claim_expires,
+                row["workflow_template_id"] != _JEROME_WORKFLOW_TEMPLATE,
+                (row["current_step_key"] or "").strip().lower() != role,
+                row["worker_pid"] is not None,
+                row["run_worker_pid"] is not None,
+            )
+        ):
+            raise ReviewerAuthorityError("worker_pid_cas_failed")
+        task_update = conn.execute(
+            """
+            UPDATE tasks SET worker_pid=?
+             WHERE id=? AND status='running' AND current_run_id=?
+               AND claim_lock=? AND claim_expires=? AND worker_pid IS NULL
+               AND workflow_template_id=? AND current_step_key=?
+            """,
+            (
+                pid, task.id, int(task.current_run_id), task.claim_lock,
+                int(task.claim_expires), _JEROME_WORKFLOW_TEMPLATE, role,
+            ),
+        )
+        run_update = conn.execute(
+            """
+            UPDATE task_runs SET worker_pid=?
+             WHERE id=? AND task_id=? AND status='running' AND ended_at IS NULL
+               AND claim_lock=? AND claim_expires=? AND worker_pid IS NULL
+               AND profile=?
+            """,
+            (
+                pid, int(task.current_run_id), task.id, task.claim_lock,
+                int(task.claim_expires), task.assignee,
+            ),
+        )
+        if task_update.rowcount != 1 or run_update.rowcount != 1:
+            raise ReviewerAuthorityError("worker_pid_cas_failed")
+        grant = {
+            "v": 1,
+            "task_id": task.id,
+            "run_id": int(task.current_run_id),
+            "claim_lock": task.claim_lock,
+            "role": role,
+            "profile": task.assignee,
+            "workflow": _JEROME_WORKFLOW_TEMPLATE,
+            "pid": pid,
+            "parent_pid": parent_pid,
+            "expires_at": int(task.claim_expires),
+            "grant_id": secrets.token_hex(32),
+        }
+        _append_event(conn, task.id, "spawned", {"pid": pid}, run_id=task.current_run_id)
+        conn.commit()
+        return grant
+    except ReviewerAuthorityError:
+        conn.rollback()
+        raise
+    except Exception as exc:
+        conn.rollback()
+        raise ReviewerAuthorityError("sqlite_authority_commit_failed") from exc
+
+
+def _commit_generic_worker_binding(
+    conn: sqlite3.Connection,
+    task: Task,
+    pid: int,
+    *,
+    parent_pid: int,
+) -> dict[str, Any]:
+    """Atomically bind a generic run before allowing user code to execute."""
+    if task.current_run_id is None or not task.claim_lock or task.claim_expires is None:
+        raise ReviewerAuthorityError("worker_pid_cas_failed")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        task_update = conn.execute(
+            """UPDATE tasks SET worker_pid=?
+                 WHERE id=? AND status='running' AND current_run_id=?
+                   AND claim_lock=? AND claim_expires=? AND worker_pid IS NULL""",
+            (pid, task.id, int(task.current_run_id), task.claim_lock, int(task.claim_expires)),
+        )
+        run_update = conn.execute(
+            """UPDATE task_runs SET worker_pid=?
+                 WHERE id=? AND task_id=? AND status='running' AND ended_at IS NULL
+                   AND claim_lock=? AND claim_expires=? AND worker_pid IS NULL
+                   AND profile=?""",
+            (pid, int(task.current_run_id), task.id, task.claim_lock,
+             int(task.claim_expires), task.assignee),
+        )
+        if task_update.rowcount != 1 or run_update.rowcount != 1:
+            raise ReviewerAuthorityError("worker_pid_cas_failed")
+        grant = {
+            "v": 1, "task_id": task.id, "run_id": int(task.current_run_id),
+            "claim_lock": task.claim_lock, "role": "worker",
+            "profile": task.assignee, "workflow": "generic", "pid": pid,
+            "parent_pid": parent_pid, "expires_at": int(task.claim_expires),
+            "grant_id": secrets.token_hex(32),
+        }
+        _append_event(conn, task.id, "spawned", {"pid": pid}, run_id=task.current_run_id)
+        conn.commit()
+        return grant
+    except ReviewerAuthorityError:
+        conn.rollback()
+        raise
+    except Exception as exc:
+        conn.rollback()
+        raise ReviewerAuthorityError("sqlite_authority_commit_failed") from exc
+
+
+def _posix_pipe() -> tuple[int, int]:
+    if hasattr(os, "pipe2"):
+        return os.pipe2(os.O_CLOEXEC)
+    pair = os.pipe()
+    try:
+        for descriptor in pair:
+            os.set_inheritable(descriptor, False)
+    except BaseException:
+        for descriptor in pair:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise
+    return pair
+
+
+def _spawn_posix_reviewer(
+    conn: sqlite3.Connection,
+    task: Task,
+    cmd: Sequence[str],
+    *,
+    cwd: Optional[str],
+    env: Mapping[str, str],
+    stdout: Any,
+    runtime: Optional[WorkerRuntimeSpec] = None,
+    generic: bool = False,
+) -> Any:
+    """Run HELLO→commit→GRANT→READY+EOF and return a handed-off process."""
+    if _IS_WINDOWS:
+        raise ReviewerAuthorityError(
+            "UNVERIFIED_PENDING_WINDOWS_CI: secure_job_unavailable"
+        )
+    from tools.reviewer_authority import (
+        BootstrapHandshakeTimeoutError,
+        read_bootstrap_frame,
+        require_bootstrap_eof,
+        write_bootstrap_frame,
+    )
+
+    bootstrap = Path(__file__).with_name("reviewer_bootstrap.py")
+    child_env = dict(env)
+    try:
+        cli_start = list(cmd).index("-p")
+    except ValueError as exc:
+        raise ReviewerAuthorityError("bootstrap_protocol_violation") from exc
+    launch_argv = list(cmd)[cli_start:]
+    review_role = (task.current_step_key or "").strip().lower()
+    if not generic and (
+        len(launch_argv) < 3
+        or launch_argv[0] != "-p"
+        or launch_argv[1] != review_role
+        or review_role not in _REVIEWER_ROLES
+    ):
+        raise ReviewerAuthorityError("bootstrap_protocol_violation")
+    child_env["HERMES_KANBAN_REVIEW_LAUNCH_ARGV"] = json.dumps(launch_argv)
+    child_env["HERMES_KANBAN_REVIEW_PYTHONPATH"] = str(bootstrap.parents[1])
+    child_env["HERMES_KANBAN_BOOTSTRAP_MODE"] = "generic" if generic else "reviewer"
+    child_env.pop("HERMES_KANBAN_REVIEW_ROLE", None)
+    all_descriptors: list[int] = []
+    bundle_fd: Optional[int] = None
+    bundle_handle: Optional[Any] = None
+    try:
+        c2p_r, c2p_w = _posix_pipe()
+        all_descriptors.extend((c2p_r, c2p_w))
+        p2c_r, p2c_w = _posix_pipe()
+        all_descriptors.extend((p2c_r, p2c_w))
+        bootstrap_cmd = [sys.executable, "-I", str(bootstrap), str(c2p_w), str(p2c_r)]
+        if runtime is not None and runtime.snapshot is not None:
+            from hermes_cli.kanban_runtime_snapshot import (
+                manifest_resource_bytes,
+                verified_snapshot_bundle,
+            )
+
+            bootstrap_bytes = manifest_resource_bytes(
+                runtime.snapshot, "hermes_cli/reviewer_bootstrap.py"
+            )
+            bundle = verified_snapshot_bundle(runtime.snapshot)
+            bundle_handle = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
+            json.dump(bundle, bundle_handle, sort_keys=True, separators=(",", ":"))
+            bundle_handle.flush()
+            bundle_handle.seek(0)
+            bundle_fd = int(bundle_handle.fileno())
+            all_descriptors.append(bundle_fd)
+            child_env["HERMES_KANBAN_VERIFIED_SNAPSHOT_FD"] = str(bundle_fd)
+            bootstrap_cmd = [
+                sys.executable, "-I", "-c",
+                "import sys;_b=bytes.fromhex(sys.argv.pop(1));exec(compile(_b,'hermes_cli/reviewer_bootstrap.py','exec'))",
+                bootstrap_bytes.hex(), str(c2p_w), str(p2c_r),
+                str(runtime.snapshot.object_root),
+                runtime.snapshot.manifest_sha256,
+                runtime.snapshot.cache_key,
+            ]
+        proc = subprocess.Popen(
+            bootstrap_cmd,
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout,
+            stderr=subprocess.STDOUT,
+            env=child_env,
+            close_fds=True,
+            pass_fds=tuple(dict.fromkeys((
+                c2p_w,
+                p2c_r,
+                *((bundle_fd,) if bundle_fd is not None else ()),
+                *((runtime.pass_fds) if runtime is not None else ()),
+            ))),
+            start_new_session=True,
+        )
+    except BaseException:
+        for descriptor in all_descriptors:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise
+    owner = HandshakeOwner(proc, (c2p_r, c2p_w, p2c_r, p2c_w))
+    deadline = time.monotonic() + _REVIEWER_HANDSHAKE_TIMEOUT
+    owner.advance("CHILD_STARTED")
+    os.close(c2p_w)
+    os.close(p2c_r)
+    owner.descriptors = [c2p_r, p2c_w]
+    try:
+        with os.fdopen(c2p_r, "rb", buffering=0) as child_stream, os.fdopen(
+            p2c_w, "wb", buffering=0
+        ) as parent_stream:
+            owner.descriptors = []
+            hello = read_bootstrap_frame(
+                child_stream,
+                max_bytes=1024,
+                fields={"challenge": str, "pid": int, "ppid": int, "v": int},
+                deadline=deadline,
+            )
+            if hello != {
+                "challenge": hello["challenge"],
+                "pid": proc.pid,
+                "ppid": os.getpid(),
+                "v": 1,
+            }:
+                raise ReviewerAuthorityError("grant_binding_mismatch")
+            owner.advance("HELLO_ACCEPTED")
+            grant = (
+                _commit_generic_worker_binding(conn, task, proc.pid, parent_pid=os.getpid())
+                if generic
+                else _commit_reviewer_authority(conn, task, proc.pid, parent_pid=os.getpid())
+            )
+            grant["challenge"] = hello["challenge"]
+            owner.advance("PID_COMMITTED")
+            write_bootstrap_frame(parent_stream, grant, max_bytes=4096, deadline=deadline)
+            owner.advance("GRANT_SENT")
+            ready = read_bootstrap_frame(
+                child_stream,
+                max_bytes=1024,
+                fields={"grant_id": str, "pid": int, "v": int},
+                deadline=deadline,
+            )
+            if ready != {"grant_id": grant["grant_id"], "pid": proc.pid, "v": 1}:
+                raise ReviewerAuthorityError("grant_binding_mismatch")
+            owner.advance("READY")
+            require_bootstrap_eof(child_stream, deadline=deadline)
+            if runtime is not None and runtime.lease is not None:
+                from hermes_cli.kanban_runtime_snapshot import (
+                    bind_snapshot_lease,
+                    mark_snapshot_lease_ready,
+                )
+
+                runtime = WorkerRuntimeSpec(
+                    argv=runtime.argv,
+                    env=runtime.env,
+                    snapshot=runtime.snapshot,
+                    lease=bind_snapshot_lease(
+                        mark_snapshot_lease_ready(runtime.lease, pid=proc.pid),
+                        pid=proc.pid,
+                    ),
+                    pass_fds=runtime.pass_fds,
+                )
+            # EOF on the grant/release pipe is the execution capability. Keep
+            # it withheld until READY+child EOF and durable lease binding have
+            # both succeeded, so generic payload code cannot race the bind.
+            parent_stream.close()
+        owner.advance("HANDED_OFF")
+        return proc
+    except Exception as exc:
+        pid_committed = owner.state in {"PID_COMMITTED", "GRANT_SENT", "READY"}
+        owner.abort_and_reap()
+        if pid_committed:
+            _activation_start_failed(conn, task, proc.pid, str(exc))
+            raise ReviewerActivationStartFailed("activation_start_failed") from exc
+        if isinstance(exc, BootstrapHandshakeTimeoutError):
+            raise ReviewerAuthorityError("bootstrap_handshake_timeout") from exc
+        raise
+
+
+def _spawn_posix_generic_worker(
+    conn: sqlite3.Connection,
+    task: Task,
+    cmd: Sequence[str],
+    *,
+    cwd: Optional[str],
+    env: Mapping[str, str],
+    stdout: Any,
+    runtime: Optional[WorkerRuntimeSpec] = None,
+) -> Any:
+    return _spawn_posix_reviewer(
+        conn, task, cmd, cwd=cwd, env=env, stdout=stdout,
+        runtime=runtime, generic=True,
+    )
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -8396,6 +9177,69 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
         if profile_exists(row["assignee"]):
             return True
     return False
+
+
+def _dispatch_preflight_error(task: Task) -> Optional[str]:
+    """Validate deterministic worker startup prerequisites before claiming."""
+    if not task.assignee:
+        return "missing assignee"
+    from hermes_cli.profiles import profile_exists, resolve_profile_env
+    if not profile_exists(task.assignee):
+        return f"unknown profile '{task.assignee}'"
+    try:
+        profile_home = resolve_profile_env(task.assignee)
+    except (FileNotFoundError, ValueError) as exc:
+        return str(exc)
+
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    token = set_hermes_home_override(profile_home)
+    try:
+        from hermes_cli.plugins import discover_plugins
+
+        discover_plugins()
+        if task.skills:
+            from tools.skills_tool import skill_view
+            for skill in task.skills:
+                try:
+                    resolved = json.loads(skill_view(str(skill), preprocess=False))
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    return f"could not resolve skill '{skill}': {exc}"
+                if not resolved.get("success"):
+                    return f"unknown skill '{skill}' for profile '{task.assignee}'"
+        from hermes_cli.config import load_config
+        from toolsets import validate_toolset
+        cfg = load_config()
+        requested = ((cfg.get("platform_toolsets") or {}).get("cli") or [])
+        mcp_names = set((cfg.get("mcp_servers") or {}).keys())
+        for toolset in requested:
+            name = str(toolset)
+            if not validate_toolset(name) and name not in mcp_names:
+                return f"unknown toolset '{name}' for profile '{task.assignee}'"
+        effective = _resolve_worker_cli_toolsets(profile_home) or []
+        for toolset in effective:
+            if not validate_toolset(toolset) and toolset not in mcp_names:
+                return f"unavailable toolset '{toolset}' for profile '{task.assignee}'"
+    finally:
+        reset_hermes_home_override(token)
+    return None
+
+
+def _block_preflight_failure(
+    conn: sqlite3.Connection, task_id: str, error: str,
+) -> None:
+    """Atomically block an invalid card without creating/consuming a run."""
+    from agent.redact import redact_sensitive_text
+
+    clean = redact_sensitive_text(error, force=True)[:500]
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET status='blocked', last_failure_error=?, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL "
+            "WHERE id=? AND status IN ('ready', 'review') AND claim_lock IS NULL",
+            (clean, task_id),
+        )
+        if cur.rowcount == 1:
+            _append_event(conn, task_id, "preflight_failed", {"error": clean})
 
 
 def dispatch_once(
@@ -8672,13 +9516,9 @@ def _dispatch_once_locked(
         except Exception:
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row_assignee):
-            # Bucket separately from skipped_unassigned: the operator
-            # cannot fix this by assigning a profile (the assignee IS the
-            # intended owner — a terminal lane). Health telemetry uses
-            # this distinction to suppress spurious "stuck" warnings on
-            # multi-lane setups where the ready queue is steadily full
-            # of human-pulled work.
-            result.skipped_nonspawnable.append(row["id"])
+            _block_preflight_failure(
+                conn, row["id"], f"unknown profile '{row_assignee}'",
+            )
             continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
@@ -8725,6 +9565,13 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
+        task_for_preflight = get_task(conn, row["id"])
+        if task_for_preflight is None:
+            continue
+        preflight_error = _dispatch_preflight_error(task_for_preflight)
+        if preflight_error:
+            _block_preflight_failure(conn, row["id"], preflight_error)
+            continue
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
@@ -8755,14 +9602,30 @@ def _dispatch_once_locked(
             import inspect
             try:
                 sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
+                if "authority_conn" in sig.parameters:
+                    pid = _spawn(
+                        claimed, str(workspace), board=board, authority_conn=conn,
+                    )
+                elif "board" in sig.parameters:
                     pid = _spawn(claimed, str(workspace), board=board)
                 else:
                     pid = _spawn(claimed, str(workspace))
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+            spawn_result = (
+                pid if isinstance(pid, SpawnedWorker)
+                else SpawnedWorker(pid=int(pid or 0))
+            )
+            if spawn_result.returncode is not None:
+                _set_worker_pid(conn, claimed.id, spawn_result.pid)
+                record_worker_exit(
+                    claimed.id, claimed.current_run_id, spawn_result.pid,
+                    spawn_result.returncode, log_path=spawn_result.log_path,
+                    db_path=kanban_db_path(board=board),
+                )
+                continue
+            if spawn_result.pid and not spawn_result.pid_committed:
+                _set_worker_pid(conn, claimed.id, spawn_result.pid)
             # NOTE: we intentionally do NOT reset consecutive_failures
             # here. A successful spawn proves the worker can start but
             # doesn't prove the run will succeed. Under unified
@@ -8779,6 +9642,8 @@ def _dispatch_once_locked(
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
+        except ReviewerActivationStartFailed:
+            continue
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
@@ -8807,15 +9672,18 @@ def _dispatch_once_locked(
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
-        try:
-            from hermes_cli.profiles import profile_exists
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row["assignee"]):
-            result.skipped_nonspawnable.append(row["id"])
-            continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
+            continue
+        task_for_preflight = get_task(conn, row["id"])
+        if task_for_preflight is None:
+            continue
+        task_for_preflight.skills = list(task_for_preflight.skills or [])
+        if "sdlc-review" not in task_for_preflight.skills:
+            task_for_preflight.skills.append("sdlc-review")
+        preflight_error = _dispatch_preflight_error(task_for_preflight)
+        if preflight_error:
+            _block_preflight_failure(conn, row["id"], preflight_error)
             continue
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
@@ -8844,22 +9712,42 @@ def _dispatch_once_locked(
         # kanban lifecycle is already injected into every worker's system
         # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
         # review agent needs.
-        claimed.skills = ["sdlc-review"]
+        claimed.skills = list(claimed.skills or [])
+        if "sdlc-review" not in claimed.skills:
+            claimed.skills.append("sdlc-review")
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             import inspect
             try:
                 sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
+                if "authority_conn" in sig.parameters:
+                    pid = _spawn(
+                        claimed, str(workspace), board=board, authority_conn=conn,
+                    )
+                elif "board" in sig.parameters:
                     pid = _spawn(claimed, str(workspace), board=board)
                 else:
                     pid = _spawn(claimed, str(workspace))
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+            spawn_result = (
+                pid if isinstance(pid, SpawnedWorker)
+                else SpawnedWorker(pid=int(pid or 0))
+            )
+            if spawn_result.returncode is not None:
+                _set_worker_pid(conn, claimed.id, spawn_result.pid)
+                record_worker_exit(
+                    claimed.id, claimed.current_run_id, spawn_result.pid,
+                    spawn_result.returncode, log_path=spawn_result.log_path,
+                    db_path=kanban_db_path(board=board),
+                )
+                continue
+            if spawn_result.pid and not spawn_result.pid_committed:
+                _set_worker_pid(conn, claimed.id, spawn_result.pid)
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
+        except ReviewerActivationStartFailed:
+            continue
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
@@ -9068,6 +9956,193 @@ def _resolve_hermes_argv() -> list[str]:
     return _module_hermes_argv()
 
 
+def _git_revision(path: Path | str) -> Optional[str]:
+    """Return the immutable Git revision containing ``path``, if available."""
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "HEAD"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    revision = completed.stdout.strip()
+    return revision if completed.returncode == 0 and _HEX_REVISION_RE.fullmatch(revision) else None
+
+
+def _git_output(path: Path | str, *args: str) -> Optional[str]:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(path), *args],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, check=False, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    value = completed.stdout.strip()
+    return value if completed.returncode == 0 and value else None
+
+
+def _git_checkout_identity(path: Path | str) -> Optional[dict[str, str]]:
+    """Return a worktree-stable, repository-specific Git identity."""
+    root_raw = _git_output(path, "rev-parse", "--show-toplevel")
+    common_raw = _git_output(
+        path, "rev-parse", "--path-format=absolute", "--git-common-dir",
+    )
+    revision = _git_revision(path)
+    roots_raw = _git_output(path, "rev-list", "--max-parents=0", "HEAD")
+    if not root_raw or not common_raw or not revision or not roots_raw:
+        return None
+    root = Path(root_raw).resolve(strict=True)
+    common = Path(common_raw).resolve(strict=True)
+    repository_id = hashlib.sha256(
+        (str(common) + "\0" + "\n".join(sorted(roots_raw.splitlines()))).encode()
+    ).hexdigest()
+    return {
+        "root": str(root),
+        "git_common_dir": str(common),
+        "repository_id": repository_id,
+        "revision": revision,
+    }
+
+
+def _dispatcher_runtime_identity() -> Optional[dict[str, str]]:
+    return _git_checkout_identity(Path(__file__).resolve().parents[1])
+
+
+def _trusted_runtime_source_root(workspace: Path | str) -> Optional[tuple[Path, dict[str, str]]]:
+    """Return an exact same-repository root; generic workspaces remain unchanged."""
+    candidate = Path(workspace).expanduser()
+    try:
+        if candidate.absolute() != candidate.resolve(strict=True):
+            return None
+    except OSError:
+        return None
+    if not (candidate / ".git").exists():
+        return None
+    workspace_identity = _git_checkout_identity(candidate)
+    dispatcher_identity = _dispatcher_runtime_identity()
+    if not workspace_identity or not dispatcher_identity:
+        return None
+    if (
+        workspace_identity["git_common_dir"] != dispatcher_identity["git_common_dir"]
+        or workspace_identity["repository_id"] != dispatcher_identity["repository_id"]
+    ):
+        return None
+    root = Path(workspace_identity["root"])
+    if candidate.resolve(strict=True) != root:
+        return None
+    return root, workspace_identity
+
+
+def _runtime_snapshot_cache_root() -> Path:
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "kanban" / "runtime-snapshots" / "v1"
+
+
+def _worker_runtime_spec(task: Task, workspace: Path | str) -> WorkerRuntimeSpec:
+    """Build a sealed snapshot for same-repository workers, else use installed Hermes."""
+    selected = _trusted_runtime_source_root(workspace)
+    if selected is None:
+        return WorkerRuntimeSpec(argv=_resolve_hermes_argv())
+    root, identity = selected
+    from hermes_cli.kanban_runtime_snapshot import (
+        build_runtime_snapshot,
+        dispatcher_runtime_bindings,
+        prepare_snapshot_lease,
+        runtime_binding_pass_fds,
+        runtime_bindings_json,
+        with_runtime_bindings,
+    )
+
+    snapshot = build_runtime_snapshot(
+        root,
+        repository_id=identity["repository_id"],
+        source_revision=identity["revision"],
+        source_dirty=bool(_git_output(root, "status", "--porcelain", "--untracked-files=all")),
+        cache_root=_runtime_snapshot_cache_root(),
+    )
+    snapshot = with_runtime_bindings(snapshot, dispatcher_runtime_bindings())
+    if task.current_run_id is None:
+        from hermes_cli.kanban_runtime_snapshot import RuntimeSnapshotError
+
+        raise RuntimeSnapshotError("snapshot_lease_missing_run")
+    lease = prepare_snapshot_lease(
+        snapshot,
+        cache_root=_runtime_snapshot_cache_root(),
+        task_id=task.id,
+        run_id=int(task.current_run_id),
+    )
+    return WorkerRuntimeSpec(
+        argv=[
+            sys.executable, "-I", "-S", "-c", _IMMUTABLE_RUNTIME_LAUNCHER,
+            str(snapshot.object_root), snapshot.manifest_sha256, snapshot.cache_key,
+            runtime_bindings_json(snapshot),
+        ],
+        env={"HERMES_KANBAN_RUNTIME_REVISION": snapshot.source_revision},
+        snapshot=snapshot,
+        lease=lease,
+        pass_fds=runtime_binding_pass_fds(snapshot.runtime_bindings),
+    )
+
+
+def _verify_worker_runtime_provenance(*, capability=None) -> Optional[dict[str, Any]]:
+    """Derive provenance solely from the bootstrap-installed capability."""
+    from hermes_cli.kanban_runtime_snapshot import snapshot_bootstrap_capability
+
+    installed = snapshot_bootstrap_capability()
+    if installed is None:
+        return None
+    if capability is not None and capability is not installed:
+        raise WorkerRuntimeMismatch("pinned runtime bootstrap capability mismatch")
+    spec = installed.spec
+    return {
+        "revision": spec.source_revision,
+        "dirty": spec.source_dirty,
+        "snapshot_cache_key": spec.cache_key,
+        "manifest_sha256": spec.manifest_sha256,
+        "content_root_sha256": spec.content_root_sha256,
+        "runtime_root": str(spec.payload_root),
+        "guard_version": installed.guard_version,
+    }
+
+
+def record_worker_runtime_provenance(*, capability=None) -> Optional[dict[str, Any]]:
+    """Durably attach sealed runtime provenance for the active worker run."""
+    receipt = _verify_worker_runtime_provenance(capability=capability)
+    if receipt is None:
+        return None
+    task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    run_id_raw = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()
+    if not task_id or not run_id_raw:
+        raise WorkerRuntimeMismatch("pinned runtime is missing task/run identity")
+    try:
+        run_id = int(run_id_raw)
+    except ValueError as exc:
+        raise WorkerRuntimeMismatch("pinned runtime has invalid run identity") from exc
+    with connect_closing() as conn:
+        with write_txn(conn):
+            row = conn.execute(
+                "SELECT metadata FROM task_runs WHERE id=? AND task_id=? AND status='running'",
+                (run_id, task_id),
+            ).fetchone()
+            if row is None:
+                raise WorkerRuntimeMismatch("pinned runtime run is not active")
+            metadata = json.loads(row["metadata"]) if row["metadata"] else {}
+            metadata["runtime_provenance"] = receipt
+            conn.execute(
+                "UPDATE task_runs SET metadata=? WHERE id=?",
+                (json.dumps(metadata, ensure_ascii=False), run_id),
+            )
+            _append_event(conn, task_id, "runtime_provenance", receipt, run_id=run_id)
+    return receipt
+
+
 def _worker_terminal_timeout_env(
     max_runtime_seconds: Optional[int],
     current_timeout: Optional[str],
@@ -9098,7 +10173,11 @@ def _worker_terminal_timeout_env(
     return str(desired)
 
 
-def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[str]]:
+def _resolve_worker_cli_toolsets(
+    hermes_home: Optional[str],
+    *,
+    task: Optional[Task] = None,
+) -> Optional[list[str]]:
     """Return the assigned profile's effective CLI toolsets for a worker.
 
     Dispatcher-spawned workers are launched from a long-lived gateway process,
@@ -9129,6 +10208,17 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
                 toolsets = [ts for ts in toolsets if ts != "kanban"]
                 if "kanban-worker-lifecycle" not in toolsets:
                     toolsets.append("kanban-worker-lifecycle")
+            role = (
+                (task.current_step_key or "").strip().lower()
+                if task is not None and _is_jerome_workflow_task(task)
+                else ""
+            )
+            if role in {"planner", "architect", "critic", "verifier"}:
+                # Do not preserve unknown/profile plugin toolsets: a custom
+                # composite can re-export a mutation tool under any name.
+                toolsets = [
+                    "review-readonly", "kanban-worker-lifecycle", "review-exec",
+                ]
         finally:
             reset_hermes_home_override(token)
         return toolsets or None
@@ -9172,7 +10262,8 @@ def _default_spawn(
     workspace: str,
     *,
     board: Optional[str] = None,
-) -> Optional[int]:
+    authority_conn: Optional[sqlite3.Connection] = None,
+) -> Optional[int | SpawnedWorker]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
     Returns the spawned child's PID so the dispatcher can detect crashes
@@ -9224,6 +10315,17 @@ def _default_spawn(
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_WORKSPACE"] = workspace
+    review_role = (
+        (task.current_step_key or "").strip().lower()
+        if _is_jerome_workflow_task(task)
+        else ""
+    )
+    # Reviewer authority is transferred only by the two-pipe bootstrap. An
+    # inherited role marker is attacker-spoofable and must never activate or
+    # identify a typed reviewer process.
+    env.pop("HERMES_KANBAN_REVIEW_ROLE", None)
+    if review_role in _REVIEWER_ROLES and authority_conn is None:
+        raise ReviewerAuthorityError("reviewer_authority_unavailable")
     # Tag the worker's session so it lands in state.db as `kanban`, not as an
     # untitled `cli` row. A worker is a dispatcher-owned run whose transcript is
     # read on the board and in `hermes kanban log` — it is not a conversation
@@ -9299,8 +10401,10 @@ def _default_spawn(
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
 
+    runtime = _worker_runtime_spec(task, workspace)
+    env.update(runtime.env)
     cmd = [
-        *_resolve_hermes_argv(),
+        *runtime.argv,
         "-p", profile_arg,
         "--cli",
         # Worker subprocesses switch to a profile-scoped HERMES_HOME above,
@@ -9331,7 +10435,7 @@ def _default_spawn(
     # branch, not a nested one.
     if task.reasoning_effort:
         cmd.extend(["--reasoning", task.reasoning_effort])
-    worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+    worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"), task=task)
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend([
@@ -9355,30 +10459,55 @@ def _default_spawn(
     rotate_bytes, backup_count = worker_log_rotation_config()
     _rotate_worker_log(log_path, rotate_bytes, backup_count)
 
+    # Windows has no trusted runtime proof for the secure Job Object adapter on
+    # this release. Fail before Popen for generic and typed workers alike; never
+    # fall back to CREATE_NEW_PROCESS_GROUP/taskkill or a single-process kill.
+    if _IS_WINDOWS:
+        raise ReviewerAuthorityError("UNVERIFIED_PENDING_WINDOWS_CI: secure_job_unavailable")
+
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")
     try:
-        proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
-            cmd,
-            cwd=workspace if os.path.isdir(workspace) else None,
-            stdin=subprocess.DEVNULL,
-            stdout=log_f,
-            stderr=subprocess.STDOUT,
-            env=env,
-            start_new_session=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
-        )
+        if review_role in _REVIEWER_ROLES and authority_conn is not None:
+            proc = _spawn_posix_reviewer(
+                authority_conn, task, cmd,
+                cwd=workspace if os.path.isdir(workspace) else None,
+                env=env, stdout=log_f, runtime=runtime,
+            )
+        else:
+            if authority_conn is None:
+                raise ReviewerAuthorityError("worker_binding_authority_unavailable")
+            proc = _spawn_posix_generic_worker(
+                authority_conn, task, cmd,
+                cwd=workspace if os.path.isdir(workspace) else None,
+                env=env, stdout=log_f, runtime=runtime,
+            )
     except FileNotFoundError:
         log_f.close()
         raise RuntimeError(
             "`hermes` executable not found on PATH. "
             "Install Hermes Agent or activate its venv before running the kanban dispatcher."
         )
+    watcher = threading.Thread(
+        target=_watch_worker_exit,
+        args=(
+            proc, task.id, task.current_run_id, log_path, kanban_db_path(board=board),
+            runtime.lease,
+        ),
+        name=f"kanban-exit-{task.id}",
+        daemon=True,
+    )
+    watcher.start()
     # NOTE: we intentionally do NOT close log_f here — we want Popen's
     # child process to keep writing after this function returns.  The
     # handle is kept alive by the child's inheritance.  The parent's
     # reference goes out of scope and is GC'd, but the OS-level FD stays
     # open in the child until the child exits.
+    if (
+        (review_role in _REVIEWER_ROLES and authority_conn is not None)
+        or runtime.lease is not None
+    ):
+        return SpawnedWorker(pid=proc.pid, pid_committed=True)
     return proc.pid
 
 
