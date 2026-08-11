@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+
+from hermes_cli import kanban_db as kb
 
 
 @dataclass
@@ -151,3 +155,91 @@ def test_handle_list_must_exactly_cover_stdio_inheritance():
 
     with pytest.raises(module.WindowsSecureSpawnError, match="handle_list_mismatch"):
         module._spawn_windows_secure_verified(spec, api=_FakeWindowsApi())
+
+
+@pytest.fixture
+def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(home / "kanban.db"))
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    return home
+
+
+def test_default_spawn_preserves_generic_windows_worker_path(
+    kanban_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    captured: dict[str, object] = {}
+
+    class FakeProc:
+        pid = 4242
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = list(cmd)
+        captured["kwargs"] = kwargs
+        return FakeProc()
+
+    class FakeThread:
+        def __init__(self, **kwargs):
+            captured["thread"] = kwargs
+
+        def start(self):
+            captured["thread_started"] = True
+
+    monkeypatch.setattr(kb, "_IS_WINDOWS", True)
+    monkeypatch.setattr(kb, "_worker_runtime_spec", lambda task, workspace: SimpleNamespace(
+        argv=("hermes",), env={}, lease=None, snapshot=None, pass_fds=()
+    ))
+    monkeypatch.setattr(kb.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(kb.threading, "Thread", FakeThread)
+    monkeypatch.setattr(kb.subprocess, "CREATE_NO_WINDOW", 0x08000000, raising=False)
+
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="generic", assignee="executor")
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert kb._default_spawn(task, str(workspace), authority_conn=conn) == 4242
+
+    assert captured["cmd"][-3:] == ["chat", "-q", f"work kanban task {task_id}"]
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["creationflags"] == 0x08000000
+    assert kwargs["start_new_session"] is False
+    assert captured["thread_started"] is True
+
+
+def test_default_spawn_rejects_typed_windows_reviewer_before_popen(
+    kanban_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    popen_called = False
+
+    def fake_popen(*args, **kwargs):
+        nonlocal popen_called
+        popen_called = True
+        raise AssertionError("Popen must not run for typed Windows reviewers")
+
+    monkeypatch.setattr(kb, "_IS_WINDOWS", True)
+    monkeypatch.setattr(kb, "_worker_runtime_spec", lambda task, workspace: SimpleNamespace(
+        argv=("hermes",), env={}, lease=None, snapshot=None, pass_fds=()
+    ))
+    monkeypatch.setattr(kb.subprocess, "Popen", fake_popen)
+
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="critic",
+            assignee="critic",
+            workflow_template_id="jerome-kanban-v1",
+            current_step_key="critic",
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        with pytest.raises(kb.ReviewerAuthorityError, match="UNVERIFIED_PENDING_WINDOWS_CI"):
+            kb._default_spawn(task, str(workspace), authority_conn=conn)
+
+    assert popen_called is False

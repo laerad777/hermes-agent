@@ -106,6 +106,42 @@ def test_legacy_text_pk_tables_rebuilt_to_integer_autoincrement(tmp_path, monkey
         assert isinstance(new_id, int) and new_id >= 1
 
 
+def test_rebuilt_comments_schema_matches_fresh_and_accepts_current_run_comment(
+    tmp_path, monkeypatch
+):
+    db_path = _setup_home(tmp_path, monkeypatch)
+    _make_legacy_db(db_path)
+    fresh_path = db_path.with_name("fresh.db")
+
+    with kb.connect(fresh_path) as fresh:
+        fresh_struct = _table_struct(fresh, "task_comments")
+
+    with kb.connect(db_path) as migrated:
+        assert _table_struct(migrated, "task_comments") == fresh_struct
+        columns = {row["name"] for row in migrated.execute("PRAGMA table_info(task_comments)")}
+        indexes = {row["name"] for row in migrated.execute("PRAGMA index_list(task_comments)")}
+        assert "run_id" in columns
+        assert "idx_comments_task_run" in indexes
+
+        task_id = kb.create_task(migrated, title="current run comment", assignee="executor")
+        claimed = kb.claim_task(migrated, task_id, claimer="executor")
+        assert claimed is not None and claimed.current_run_id is not None
+        comment_id = kb.add_comment(
+            migrated,
+            task_id,
+            author="executor",
+            body="durable current-run evidence",
+            expected_run_id=claimed.current_run_id,
+            reviewer_profile="executor",
+        )
+        assert comment_id > 0
+
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    with kb.connect(db_path) as reopened:
+        assert _table_struct(reopened, "task_comments") == fresh_struct
+        assert reopened.execute(
+            "SELECT body FROM task_comments WHERE id = ?", (comment_id,)
+        ).fetchone()["body"] == "durable current-run evidence"
 
 
 def test_migration_is_idempotent(tmp_path, monkeypatch):
@@ -120,6 +156,40 @@ def test_migration_is_idempotent(tmp_path, monkeypatch):
         id_col = {r["name"]: r for r in conn.execute("PRAGMA table_info(task_events)")}["id"]
         assert id_col["type"].upper() == "INTEGER"
         assert len(conn.execute("SELECT * FROM task_events").fetchall()) == 2
+
+
+def test_review_authority_snapshot_digest_column_is_added_to_existing_table(
+    tmp_path, monkeypatch
+):
+    db_path = _setup_home(tmp_path, monkeypatch)
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(kb.SCHEMA_SQL)
+    conn.execute("ALTER TABLE review_run_authority RENAME TO old_review_run_authority")
+    conn.execute(
+        """CREATE TABLE review_run_authority (
+            run_id INTEGER PRIMARY KEY, task_id TEXT NOT NULL,
+            reviewer_profile TEXT NOT NULL, role TEXT NOT NULL,
+            authority_mode TEXT NOT NULL, threat_model TEXT NOT NULL,
+            subject_kind TEXT NOT NULL, subject_version INTEGER NOT NULL,
+            subject_json TEXT NOT NULL, subject_digest TEXT NOT NULL,
+            inspected_revision TEXT NOT NULL,
+            workspace_realpath TEXT, workspace_dev INTEGER, workspace_ino INTEGER,
+            git_dir_realpath TEXT, git_dir_dev INTEGER, git_dir_ino INTEGER,
+            common_dir_realpath TEXT, common_dir_dev INTEGER, common_dir_ino INTEGER,
+            created_at INTEGER NOT NULL, UNIQUE(task_id, run_id)
+        )"""
+    )
+    conn.execute("DROP TABLE old_review_run_authority")
+    conn.commit()
+    conn.close()
+
+    with kb.connect(db_path) as migrated:
+        columns = {
+            row["name"] for row in migrated.execute(
+                "PRAGMA table_info(review_run_authority)"
+            )
+        }
+        assert "git_snapshot_digest" in columns
 
 
 def test_unseen_events_for_sub_survives_migrated_db(tmp_path, monkeypatch):
