@@ -205,4 +205,152 @@ class TestSendWithRetryAfter:
         # Second sleep should use the retry_after from the second result
         second_sleep = mock_sleep.call_args_list[1][0][0]
         assert second_sleep >= 29.0  # 30 - 1 (max jitter)
+@pytest.mark.asyncio
+async def test_native_poll_bypasses_retry_notice_and_plaintext_fallback():
+    from gateway.discord_native import validate_discord_native_payload
 
+    adapter = _StubAdapter()
+    adapter.send = AsyncMock(return_value=SendResult(
+        success=False,
+        error="network",
+        retryable=True,
+        delivery_certainty="unknown",
+    ))
+    payload = validate_discord_native_payload("poll", {
+        "question": "Ship?",
+        "answers": [{"text": "Yes"}, {"text": "No"}],
+        "duration_hours": 24,
+    })
+
+    result = await adapter._send_with_retry(
+        "1", "summary", metadata={
+            "discord_native_payload": payload,
+            "_discord_delivery_obligation_id": "turn:message-1",
+        }, max_retries=2,
+    )
+
+    assert not result.success
+    assert adapter.send.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_native_poll_without_authoritative_obligation_fails_closed_without_send():
+    from gateway.discord_native import validate_discord_native_payload
+
+    adapter = _StubAdapter()
+    adapter.send = AsyncMock()
+    payload = validate_discord_native_payload("poll", {
+        "question": "Ship?",
+        "answers": [{"text": "Yes"}, {"text": "No"}],
+        "duration_hours": 24,
+    })
+
+    result = await adapter._send_with_retry(
+        "1", "model-controlled summary",
+        metadata={"discord_native_payload": payload},
+    )
+
+    assert not result.success
+    assert result.structured_failure == "poll_obligation_missing"
+    adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_native_poll_identity_ignores_public_text_and_model_identity_override():
+    from gateway.discord_native import validate_discord_native_payload
+
+    adapter = _StubAdapter()
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="ok"))
+    payload = validate_discord_native_payload("poll", {
+        "question": "Ship?",
+        "answers": [{"text": "Yes"}, {"text": "No"}],
+        "duration_hours": 24,
+    })
+    metadata = {
+        "discord_native_payload": payload,
+        "_discord_delivery_obligation_id": "cron:job-1:run-1",
+        "_discord_logical_delivery_id": "model-spoof",
+    }
+
+    await adapter._send_with_retry("1", "summary A", metadata=metadata)
+    await adapter._send_with_retry("1", "summary B", metadata=metadata)
+
+    first = adapter.send.await_args_list[0].kwargs["metadata"]
+    second = adapter.send.await_args_list[1].kwargs["metadata"]
+    assert first["_discord_logical_delivery_id"] == second["_discord_logical_delivery_id"]
+    assert first["_discord_logical_delivery_id"] != "model-spoof"
+    assert first["_discord_poll_obligation_hash"] == second["_discord_poll_obligation_hash"]
+
+
+@pytest.mark.asyncio
+async def test_native_poll_identity_scopes_obligation_to_target():
+    from gateway.discord_native import validate_discord_native_payload
+
+    adapter = _StubAdapter()
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="ok"))
+    payload = validate_discord_native_payload("poll", {
+        "question": "Ship?",
+        "answers": [{"text": "Yes"}, {"text": "No"}],
+        "duration_hours": 24,
+    })
+
+    for chat_id, reply_to in (("1", None), ("2", "thread-9")):
+        await adapter._send_with_retry(
+            chat_id, "same summary", reply_to=reply_to, metadata={
+                "discord_native_payload": payload,
+                "_discord_delivery_obligation_id": "cron:job-1:run-1",
+            },
+        )
+
+    first = adapter.send.await_args_list[0].kwargs["metadata"]
+    second = adapter.send.await_args_list[1].kwargs["metadata"]
+    assert first["_discord_poll_obligation_hash"] != second["_discord_poll_obligation_hash"]
+    assert first["_discord_logical_delivery_id"] != second["_discord_logical_delivery_id"]
+
+
+@pytest.mark.asyncio
+async def test_native_poll_identity_scopes_obligation_to_thread_metadata():
+    from gateway.discord_native import validate_discord_native_payload
+
+    adapter = _StubAdapter()
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="ok"))
+    payload = validate_discord_native_payload("poll", {
+        "question": "Ship?", "answers": [{"text": "Yes"}, {"text": "No"}],
+        "duration_hours": 24,
+    })
+
+    for thread_id in ("thread-1", "thread-2"):
+        await adapter._send_with_retry("1", "summary", metadata={
+            "discord_native_payload": payload,
+            "_discord_delivery_obligation_id": "cron:job-1:run-1",
+            "thread_id": thread_id,
+        })
+
+    first = adapter.send.await_args_list[0].kwargs["metadata"]
+    second = adapter.send.await_args_list[1].kwargs["metadata"]
+    assert first["_discord_poll_target_hash"] != second["_discord_poll_target_hash"]
+    assert first["_discord_poll_obligation_hash"] != second["_discord_poll_obligation_hash"]
+
+
+@pytest.mark.asyncio
+async def test_native_poll_same_payload_uses_distinct_identity_for_distinct_cron_runs():
+    from gateway.discord_native import validate_discord_native_payload
+
+    adapter = _StubAdapter()
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="ok"))
+    payload = validate_discord_native_payload("poll", {
+        "question": "Ship?",
+        "answers": [{"text": "Yes"}, {"text": "No"}],
+        "duration_hours": 24,
+    })
+
+    for run_id in ("run-1", "run-2"):
+        await adapter._send_with_retry("1", "same summary", metadata={
+            "discord_native_payload": payload,
+            "_discord_delivery_obligation_id": f"cron:job-1:{run_id}",
+        })
+
+    first = adapter.send.await_args_list[0].kwargs["metadata"]
+    second = adapter.send.await_args_list[1].kwargs["metadata"]
+    assert first["_discord_logical_delivery_id"] != second["_discord_logical_delivery_id"]
+    assert first["_discord_poll_payload_hash"] == second["_discord_poll_payload_hash"]

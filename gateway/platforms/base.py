@@ -6,8 +6,10 @@ and implement the required methods.
 """
 
 import asyncio
+import hashlib
 import inspect
 import ipaddress
+import json
 import logging
 import os
 import random
@@ -98,6 +100,16 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
         if anchor is not None:
             metadata["telegram_reply_to_message_id"] = str(anchor)
     return metadata
+
+
+def _poll_obligation_metadata(event: "MessageEvent") -> dict[str, str]:
+    """Derive an authoritative delivery obligation from the inbound event."""
+    if _platform_name(getattr(getattr(event, "source", None), "platform", None)) != "discord":
+        return {}
+    message_id = str(getattr(event, "message_id", "") or "").strip()
+    if not message_id:
+        return {}
+    return {"_discord_delivery_obligation_id": f"turn:{message_id}"}
 
 
 def _mark_notify_metadata(metadata: dict | None) -> dict:
@@ -2252,8 +2264,25 @@ class _GatewayDeliveryResponse(str):
 
 
 def _freeze_gateway_delivery_metadata(metadata: Any) -> dict:
-    """Accept only immutable, validated Discord details envelopes."""
-    if not isinstance(metadata, dict) or set(metadata) != {"discord_product_details"}:
+    """Accept one immutable, validated Discord structured payload."""
+    if not isinstance(metadata, dict) or len(metadata) != 1:
+        return {}
+    if set(metadata) == {"discord_native_payload"}:
+        from gateway.discord_native import (
+            DiscordNativePayloadV1,
+            validate_discord_native_payload,
+        )
+
+        payload = metadata["discord_native_payload"]
+        if not isinstance(payload, DiscordNativePayloadV1):
+            return {}
+        try:
+            fresh = validate_discord_native_payload(payload.kind, payload.payload)
+            payload = type(payload)(fresh.kind, fresh.payload, payload.owner_user_id)
+        except (TypeError, ValueError):
+            return {}
+        return {"discord_native_payload": payload}
+    if set(metadata) != {"discord_product_details"}:
         return {}
     from gateway.discord_product_details import (
         DiscordProductDetailsEnvelopeV1,
@@ -2273,9 +2302,17 @@ def _freeze_gateway_delivery_metadata(metadata: Any) -> dict:
 def _unwrap_gateway_delivery_response(value: Any) -> tuple[Any, Optional[dict]]:
     if not isinstance(value, _GatewayDeliveryResponse):
         return value, None
+    frozen = getattr(value, "delivery_metadata", {})
+    native = frozen.get("discord_native_payload")
+    if native is not None:
+        from gateway.discord_native import discord_native_to_mapping
+
+        mapping = discord_native_to_mapping(native)
+        if native.owner_user_id is not None:
+            mapping["owner_user_id"] = native.owner_user_id
+        return str(value), {"discord_native_payload": mapping}
     from gateway.discord_product_details import discord_product_details_to_canonical_mapping
 
-    frozen = getattr(value, "delivery_metadata", {})
     envelope = frozen.get("discord_product_details")
     metadata = (
         {"discord_product_details": discord_product_details_to_canonical_mapping(envelope)}
@@ -2286,9 +2323,45 @@ def _unwrap_gateway_delivery_response(value: Any) -> tuple[Any, Optional[dict]]:
 
 
 def _merge_gateway_delivery_metadata(routing_metadata: Any, delivery_metadata: Any) -> dict:
-    """Merge the sole structured allowlist key without overriding routing."""
+    """Merge one structured allowlist key without overriding routing."""
     merged = dict(routing_metadata) if isinstance(routing_metadata, dict) else {}
-    if not isinstance(delivery_metadata, dict) or set(delivery_metadata) != {"discord_product_details"}:
+    if not isinstance(delivery_metadata, dict) or len(delivery_metadata) != 1:
+        return merged
+    incoming_key = next(iter(delivery_metadata))
+    if incoming_key not in {"discord_product_details", "discord_native_payload"}:
+        return merged
+    other_key = (
+        "discord_native_payload"
+        if incoming_key == "discord_product_details"
+        else "discord_product_details"
+    )
+    if other_key in merged:
+        merged.pop(other_key, None)
+        merged.pop(incoming_key, None)
+        logger.warning("gateway_delivery_metadata_conflict")
+        return merged
+    if incoming_key == "discord_native_payload":
+        from gateway.discord_native import discord_native_to_mapping, validate_discord_native_payload
+
+        try:
+            raw = delivery_metadata[incoming_key]
+            if isinstance(raw, dict):
+                owner = raw.get("owner_user_id")
+                raw = validate_discord_native_payload(raw.get("kind"), raw.get("payload"))
+                raw = type(raw)(raw.kind, raw.payload, owner)
+            incoming = discord_native_to_mapping(
+                validate_discord_native_payload(raw.kind, raw.payload)
+            )
+            if raw.owner_user_id is not None:
+                incoming["owner_user_id"] = raw.owner_user_id
+        except (AttributeError, TypeError, ValueError):
+            return merged
+        current = merged.get(incoming_key)
+        if current is not None and current != incoming:
+            merged.pop(incoming_key, None)
+            logger.warning("gateway_delivery_metadata_conflict")
+            return merged
+        merged[incoming_key] = incoming
         return merged
     from gateway.discord_product_details import (
         discord_product_details_to_canonical_mapping,
@@ -5123,9 +5196,79 @@ class BasePlatformAdapter(ABC):
         know to retry rather than waiting indefinitely.
         """
 
-        structured = isinstance(metadata, dict) and "discord_product_details" in metadata
+        native = metadata.get("discord_native_payload") if isinstance(metadata, dict) else None
+        native_kind = (
+            getattr(native, "kind", None)
+            if not isinstance(native, dict)
+            else native.get("kind")
+        )
+        if native_kind == "poll":
+            # Poll creation is non-idempotent. v1 permits exactly one adapter
+            # invocation and deliberately suppresses retry, exhausted notices,
+            # and plain-text fallback for both terminal failure classes.
+            metadata = dict(metadata)
+            obligation_id = str(metadata.get("_discord_delivery_obligation_id") or "").strip()
+            if not obligation_id:
+                return SendResult(
+                    success=False,
+                    error="authoritative poll delivery obligation is missing",
+                    retryable=False,
+                    delivery_certainty="not_sent",
+                    structured_failure="poll_obligation_missing",
+                )
+            from gateway.discord_native import (
+                discord_native_to_mapping,
+                validate_discord_native_payload,
+            )
+
+            if isinstance(native, dict):
+                native = validate_discord_native_payload(
+                    native.get("kind"), native.get("payload")
+                )
+
+            payload_json = json.dumps(
+                discord_native_to_mapping(native),
+                sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+            )
+            target_scope = metadata if isinstance(metadata, dict) else {}
+            target_identity = "\0".join((
+                _platform_name(self.platform),
+                str(chat_id),
+                str(target_scope.get("thread_id") or ""),
+                str(target_scope.get("message_thread_id") or ""),
+                str(target_scope.get("direct_messages_topic_id") or ""),
+                str(reply_to or ""),
+            ))
+            target_hash = hashlib.sha256(
+                target_identity.encode("utf-8", "replace")
+            ).hexdigest()
+            obligation_hash = hashlib.sha256("\0".join((
+                target_identity, obligation_id,
+            )).encode("utf-8", "replace")).hexdigest()
+            payload_hash = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+            identity = "\0".join((
+                "hermes.discord.poll.v1", target_identity,
+                obligation_id, payload_hash,
+            ))
+            metadata["_discord_logical_delivery_id"] = hashlib.sha256(
+                identity.encode("utf-8", "replace")
+            ).hexdigest()[:24]
+            metadata["_discord_poll_obligation_hash"] = obligation_hash
+            metadata["_discord_poll_target_hash"] = target_hash
+            metadata["_discord_poll_payload_hash"] = payload_hash
+            return await self.send(
+                chat_id=chat_id,
+                content=content,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+        structured = isinstance(metadata, dict) and (
+            "discord_product_details" in metadata
+            or "discord_native_payload" in metadata
+        )
         routing_metadata = dict(metadata) if isinstance(metadata, dict) else {}
         routing_metadata.pop("discord_product_details", None)
+        routing_metadata.pop("discord_native_payload", None)
         routing_metadata.pop("_discord_structured_delivery_handle", None)
         handle = None
         terminal_outcome = None
@@ -6101,6 +6244,7 @@ class BasePlatformAdapter(ABC):
                 # metadata stays unmarked and progress bubbles remain
                 # thread-strict.
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
+                _final_thread_metadata.update(_poll_obligation_metadata(event))
                 if text_content and not (images or local_files or media_files):
                     _final_thread_metadata = _merge_gateway_delivery_metadata(
                         _final_thread_metadata, _gateway_delivery_metadata,
@@ -6212,9 +6356,21 @@ class BasePlatformAdapter(ABC):
                     # Slash-command and ephemeral replies are cheap to
                     # regenerate and are not recorded.
                     _obligation_id = None
-                    if not is_ephemeral_response and not str(
+                    _native_final = _final_thread_metadata.get(
+                        "discord_native_payload"
+                    ) if isinstance(_final_thread_metadata, dict) else None
+                    _native_final_kind = (
+                        _native_final.get("kind")
+                        if isinstance(_native_final, dict)
+                        else getattr(_native_final, "kind", None)
+                    )
+                    if (
+                        _native_final_kind != "poll"
+                        and not is_ephemeral_response
+                        and not str(
                         event.text or ""
-                    ).lstrip().startswith(("/", self.typed_command_prefix or "!")):
+                        ).lstrip().startswith(("/", self.typed_command_prefix or "!"))
+                    ):
                         try:
                             from gateway.delivery_ledger import (
                                 compute_obligation_id,
