@@ -47,6 +47,14 @@ def _ensure_discord_mock():
 _ensure_discord_mock()
 
 from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
+from plugins.platforms.discord.product_details import DiscordProductDetailStore  # noqa: E402
+from plugins.platforms.discord.product_details import secure_store_capability  # noqa: E402
+
+
+requires_secure_product_store = pytest.mark.skipif(
+    not secure_store_capability().available,
+    reason=secure_store_capability().reason,
+)
 
 
 MAX = DiscordAdapter.MAX_MESSAGE_LENGTH  # 2000
@@ -61,8 +69,8 @@ def _wire_channel(adapter, *, original_msg, send_side_effect=None):
     records every ``channel.send`` call."""
     sends = []
 
-    async def fake_send(*, content, reference=None):
-        sends.append({"content": content, "reference": reference})
+    async def fake_send(*, content, reference=None, view=None):
+        sends.append({"content": content, "reference": reference, "view": view})
         if send_side_effect is not None:
             res = send_side_effect(len(sends), content, reference)
             if res is not None:
@@ -104,6 +112,80 @@ class TestEditMessageHappyPath:
         assert result.continuation_message_ids == ()
         assert edits == ["short reply"]
         assert sends == []  # no continuations for a short edit
+
+    @pytest.mark.asyncio
+    @requires_secure_product_store
+    async def test_final_edit_attaches_persistent_product_details_view(self, tmp_path):
+        adapter = _make_adapter()
+        adapter._product_details_store = DiscordProductDetailStore(tmp_path)
+        msg = SimpleNamespace(id=42, edit=AsyncMock())
+        _wire_channel(adapter, original_msg=msg)
+        metadata = {
+            "discord_product_details": {
+                "items": [{"label": "one", "title": "A", "body": "secret"}],
+                "ttl_seconds": 60,
+                "owner_user_id": "123",
+            }
+        }
+
+        result = await adapter.edit_message(
+            "555", "42", "summary", finalize=True, metadata=metadata,
+        )
+
+        assert result.success is True
+        kwargs = msg.edit.await_args.kwargs
+        assert kwargs["content"] == "summary"
+        assert kwargs["view"].timeout is None
+        restored = adapter._product_details_store.restore_active_deliveries()
+        assert len(restored) == 1
+        assert restored[0][2] == "42"
+
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("cleanup_raises", [False, True])
+    async def test_bind_exception_discards_once_and_preserves_original_error(
+        self, cleanup_raises,
+    ):
+        delivery = SimpleNamespace(custom_ids=("hpd:v1:test:0:1:sig",))
+
+        class Store:
+            def __init__(self):
+                self.discard_attempts = 0
+
+            def prepare_delivery(self, **_kwargs):
+                return delivery
+
+            def bind_delivery(self, candidate, message_id):
+                assert candidate is delivery
+                assert message_id == "42"
+                raise RuntimeError("original bind exploded")
+
+            def discard_delivery(self, candidate):
+                assert candidate is delivery
+                self.discard_attempts += 1
+                if cleanup_raises:
+                    raise OSError("cleanup exploded")
+                return True
+
+        adapter = _make_adapter()
+        store = Store()
+        adapter._product_details_store = store
+        msg = SimpleNamespace(id=42, edit=AsyncMock())
+        _wire_channel(adapter, original_msg=msg)
+
+        result = await adapter.edit_message(
+            "555", "42", "summary", finalize=True,
+            metadata={"discord_product_details": {
+                "items": [{"label": "one", "title": "A", "body": "secret"}],
+                "ttl_seconds": 60,
+            }},
+        )
+
+        assert result.success is False
+        assert result.error == "original bind exploded"
+        assert store.discard_attempts == 1
+        assert msg.edit.await_count == 2
+        assert msg.edit.await_args.kwargs == {"content": "summary", "view": None}
 
 
 # --------------------------------------------------------------------------- #
@@ -241,6 +323,31 @@ class TestFinalOverflowSplits:
         delivered = "".join(edits + [s["content"] for s in sends])
         assert "END_MARKER_XYZ" in delivered
 
+    @pytest.mark.asyncio
+    @requires_secure_product_store
+    async def test_product_details_view_binds_to_last_continuation(self, tmp_path):
+        adapter = _make_adapter()
+        adapter._product_details_store = DiscordProductDetailStore(tmp_path)
+        msg = SimpleNamespace(id=42, edit=AsyncMock())
+        _channel, sends = _wire_channel(adapter, original_msg=msg)
+        metadata = {
+            "discord_guild_id": "guild",
+            "discord_product_details": {
+                "items": [{"label": "one", "title": "A", "body": "secret"}],
+                "ttl_seconds": 60,
+            },
+        }
+
+        result = await adapter.edit_message(
+            "555", "42", "x" * 5000, finalize=True, metadata=metadata,
+        )
+
+        assert result.success
+        assert sends[-1]["view"] is not None
+        assert all(call["view"] is None for call in sends[:-1])
+        restored = adapter._product_details_store.restore_active_deliveries()
+        assert restored[0][2] == result.message_id
+
 
 # --------------------------------------------------------------------------- #
 # Reactive overflow — Discord 50035 mid-edit triggers the same branch logic
@@ -277,6 +384,94 @@ class TestReactiveOverflowDetection:
         assert result.success is True
         # Reactive split re-edited chunk 1 and may add continuations.
         assert len(edit_calls) >= 1
+
+    @pytest.mark.asyncio
+    @requires_secure_product_store
+    async def test_single_chunk_reactive_retry_attaches_and_binds_product_view(self, tmp_path):
+        adapter = _make_adapter()
+        adapter._product_details_store = DiscordProductDetailStore(tmp_path)
+        calls = []
+
+        async def edit_effect(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise RuntimeError(
+                    "400 Bad Request (error code: 50035): Invalid Form Body "
+                    "Must be 2000 or fewer in length"
+                )
+
+        msg = SimpleNamespace(id=42, edit=AsyncMock(side_effect=edit_effect))
+        _wire_channel(adapter, original_msg=msg)
+        metadata = {"discord_product_details": {
+            "items": [{"label": "one", "title": "A", "body": "secret"}],
+            "ttl_seconds": 60,
+        }}
+
+        result = await adapter.edit_message(
+            "555", "42", "summary", finalize=True, metadata=metadata,
+        )
+
+        assert result.success is True
+        assert calls[-1]["view"] is not None
+        restored = adapter._product_details_store.restore_active_deliveries()
+        assert len(restored) == 1
+        assert restored[0][2] == "42"
+
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("cleanup_raises", [False, True])
+    async def test_single_chunk_bind_exception_discards_once_and_preserves_error(
+        self, cleanup_raises,
+    ):
+        delivery = SimpleNamespace(custom_ids=("hpd:v1:test:0:1:sig",))
+
+        class Store:
+            def __init__(self):
+                self.discard_attempts = 0
+
+            def prepare_delivery(self, **_kwargs):
+                return delivery
+
+            def bind_delivery(self, candidate, message_id):
+                assert candidate is delivery
+                assert message_id == "42"
+                raise RuntimeError("reactive bind exploded")
+
+            def discard_delivery(self, candidate):
+                assert candidate is delivery
+                self.discard_attempts += 1
+                if cleanup_raises:
+                    raise OSError("cleanup exploded")
+                return True
+
+        calls = []
+
+        async def edit_effect(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise RuntimeError(
+                    "400 Bad Request (error code: 50035): Invalid Form Body "
+                    "Must be 2000 or fewer in length"
+                )
+
+        adapter = _make_adapter()
+        store = Store()
+        adapter._product_details_store = store
+        msg = SimpleNamespace(id=42, edit=AsyncMock(side_effect=edit_effect))
+        _wire_channel(adapter, original_msg=msg)
+
+        result = await adapter.edit_message(
+            "555", "42", "summary", finalize=True,
+            metadata={"discord_product_details": {
+                "items": [{"label": "one", "title": "A", "body": "secret"}],
+                "ttl_seconds": 60,
+            }},
+        )
+
+        assert result.success is False
+        assert result.error == "reactive bind exploded"
+        assert store.discard_attempts == 1
+        assert calls[-1] == {"content": "summary", "view": None}
 
 
 # --------------------------------------------------------------------------- #
