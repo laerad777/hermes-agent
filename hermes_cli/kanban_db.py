@@ -77,17 +77,20 @@ import os
 import re
 import random
 import secrets
+import signal
 import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
+import unicodedata
 import logging
 import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -993,6 +996,7 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    subject_version: int = 0
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1087,6 +1091,11 @@ class Task:
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
             ),
+            subject_version=(
+                int(row["subject_version"])
+                if "subject_version" in keys and row["subject_version"] is not None
+                else 0
+            ),
         )
 
 
@@ -1151,6 +1160,7 @@ class Comment:
     author: str
     body: str
     created_at: int
+    run_id: Optional[int] = None
 
 
 @dataclass
@@ -1274,7 +1284,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    subject_version      INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1288,7 +1299,28 @@ CREATE TABLE IF NOT EXISTS task_comments (
     task_id    TEXT NOT NULL,
     author     TEXT NOT NULL,
     body       TEXT NOT NULL,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    run_id     INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS review_run_authority (
+    run_id INTEGER PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    reviewer_profile TEXT NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('architect', 'critic')),
+    authority_mode TEXT NOT NULL CHECK(authority_mode = 'trusted_workspace_snapshot_v1'),
+    threat_model TEXT NOT NULL CHECK(threat_model = 'trusted workspace snapshot; no concurrent hostile filesystem mutation'),
+    subject_kind TEXT NOT NULL CHECK(subject_kind IN ('task_snapshot_v1', 'git_workspace_head_v1')),
+    subject_version INTEGER NOT NULL,
+    subject_json TEXT NOT NULL,
+    subject_digest TEXT NOT NULL,
+    inspected_revision TEXT NOT NULL,
+    git_snapshot_digest TEXT,
+    workspace_realpath TEXT, workspace_dev INTEGER, workspace_ino INTEGER,
+    git_dir_realpath TEXT, git_dir_dev INTEGER, git_dir_ino INTEGER,
+    common_dir_realpath TEXT, common_dir_dev INTEGER, common_dir_ino INTEGER,
+    created_at INTEGER NOT NULL,
+    UNIQUE(task_id, run_id)
 );
 
 CREATE TABLE IF NOT EXISTS task_events (
@@ -1369,6 +1401,7 @@ CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_review_authority_task ON review_run_authority(task_id, run_id);
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
@@ -2473,6 +2506,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences",
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
+    if "subject_version" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "subject_version",
+            "subject_version INTEGER NOT NULL DEFAULT 0",
+        )
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
@@ -2488,6 +2526,52 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
     )
+
+    comments_exist = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_comments'"
+    ).fetchone() is not None
+    if comments_exist:
+        comment_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(task_comments)")
+        }
+        if "run_id" not in comment_cols:
+            _add_column_if_missing(conn, "task_comments", "run_id", "run_id INTEGER")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_comments_task_run "
+            "ON task_comments(task_id, run_id, id)"
+        )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS review_run_authority (
+            run_id INTEGER PRIMARY KEY, task_id TEXT NOT NULL,
+            reviewer_profile TEXT NOT NULL,
+            role TEXT NOT NULL CHECK(role IN ('architect', 'critic')),
+            authority_mode TEXT NOT NULL CHECK(authority_mode = 'trusted_workspace_snapshot_v1'),
+            threat_model TEXT NOT NULL CHECK(threat_model = 'trusted workspace snapshot; no concurrent hostile filesystem mutation'),
+            subject_kind TEXT NOT NULL CHECK(subject_kind IN ('task_snapshot_v1', 'git_workspace_head_v1')),
+            subject_version INTEGER NOT NULL, subject_json TEXT NOT NULL,
+            subject_digest TEXT NOT NULL, inspected_revision TEXT NOT NULL,
+            git_snapshot_digest TEXT,
+            workspace_realpath TEXT, workspace_dev INTEGER, workspace_ino INTEGER,
+            git_dir_realpath TEXT, git_dir_dev INTEGER, git_dir_ino INTEGER,
+            common_dir_realpath TEXT, common_dir_dev INTEGER, common_dir_ino INTEGER,
+            created_at INTEGER NOT NULL, UNIQUE(task_id, run_id)
+        )
+        """
+    )
+    authority_cols = {
+        row["name"] for row in conn.execute("PRAGMA table_info(review_run_authority)")
+    }
+    if "git_snapshot_digest" not in authority_cols:
+        _add_column_if_missing(
+            conn, "review_run_authority", "git_snapshot_digest",
+            "git_snapshot_digest TEXT",
+        )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_review_authority_task "
+        "ON review_run_authority(task_id, run_id)"
+    )
+    conn.execute("DROP TRIGGER IF EXISTS trg_review_subject_immutable")
 
     # task_events gained a run_id column; back-fill it as NULL for
     # historical events (they predate runs and can't be attributed).
@@ -2594,6 +2678,25 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         )
 
     _rebuild_drifted_tables(conn)
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_review_subject_immutable
+        BEFORE UPDATE OF title, body, assignee, current_step_key ON tasks
+        WHEN EXISTS (
+            SELECT 1 FROM review_run_authority a
+            JOIN task_runs r ON r.id = a.run_id
+            WHERE a.task_id = OLD.id AND r.ended_at IS NULL
+              AND OLD.current_run_id = a.run_id
+        ) AND (
+            NEW.title IS NOT OLD.title OR NEW.body IS NOT OLD.body OR
+            NEW.assignee IS NOT OLD.assignee OR
+            NEW.current_step_key IS NOT OLD.current_step_key
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'active review subject is immutable');
+        END
+        """
+    )
 
 
 # Legacy DBs defined these tables with a ``TEXT PRIMARY KEY`` id (or, for
@@ -2624,8 +2727,11 @@ _REBUILD_SPECS = {
         "CREATE TABLE task_comments ("
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " task_id TEXT NOT NULL, author TEXT NOT NULL, body TEXT NOT NULL,"
-        " created_at INTEGER NOT NULL)",
-        ("CREATE INDEX idx_comments_task ON task_comments(task_id, created_at)",),
+        " created_at INTEGER NOT NULL, run_id INTEGER)",
+        (
+            "CREATE INDEX idx_comments_task ON task_comments(task_id, created_at)",
+            "CREATE INDEX idx_comments_task_run ON task_comments(task_id, run_id, id)",
+        ),
     ),
     "task_runs": (
         "CREATE TABLE task_runs ("
@@ -3346,6 +3452,805 @@ def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
     return Task.from_row(row) if row else None
 
 
+class ReviewAuthorityError(RuntimeError):
+    """Strict review authority could not be bound or revalidated."""
+
+
+_REVIEW_AUTHORITY_MODE = "trusted_workspace_snapshot_v1"
+_REVIEW_THREAT_MODEL = (
+    "trusted workspace snapshot; no concurrent hostile filesystem mutation"
+)
+_REVIEW_GIT_SNAPSHOT_MAX_ITEMS = 100_000
+_REVIEW_GIT_SNAPSHOT_MAX_BYTES = 512 * 1024 * 1024
+_REVIEW_GIT_SNAPSHOT_MAX_SECONDS = 15.0
+_REVIEW_GIT_METADATA_MAX_BYTES = 16 * 1024 * 1024
+
+
+def _review_subject(conn: sqlite3.Connection, task: Task) -> tuple[str, str]:
+    parents = parent_ids(conn, task.id)
+    completed_parent_runs: list[dict[str, int]] = []
+    for parent_id in parents:
+        row = conn.execute(
+            "SELECT current_run_id, status FROM tasks WHERE id = ?", (parent_id,)
+        ).fetchone()
+        if row and row["status"] == "done" and row["current_run_id"] is not None:
+            completed_parent_runs.append(
+                {"task_id": parent_id, "run_id": int(row["current_run_id"])}
+            )
+    payload = {
+        "id": task.id,
+        "title": task.title,
+        "body": task.body or "",
+        "role": (task.current_step_key or task.assignee or "").strip().lower(),
+        "workflow_template_id": task.workflow_template_id,
+        "legacy_marker": _JEROME_WORKFLOW_MARKER in (task.body or ""),
+        "assignee": task.assignee,
+        "subject_version": task.subject_version,
+        "parent_ids": parents,
+        "completed_parent_runs": completed_parent_runs,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return raw, hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _bounded_git_text(path: Path) -> str:
+    data = path.read_bytes()
+    if len(data) > 4096:
+        raise ReviewAuthorityError("malformed Git administrative file")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ReviewAuthorityError("malformed Git administrative file") from exc
+    if any(unicodedata.category(ch).startswith("C") for ch in text.rstrip("\r\n")):
+        raise ReviewAuthorityError("malformed Git administrative file")
+    return text
+
+
+def _git_dir_from_file(dotgit: Path) -> Path:
+    text = _bounded_git_text(dotgit)
+    if not text.startswith("gitdir:"):
+        raise ReviewAuthorityError("malformed Git workspace .git file")
+    raw = text.split(":", 1)[1].strip()
+    if not raw:
+        raise ReviewAuthorityError("malformed Git workspace .git file")
+    target = Path(raw)
+    if not target.is_absolute():
+        target = dotgit.parent / target
+    try:
+        return target.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ReviewAuthorityError("malformed Git workspace .git file") from exc
+
+
+def _linked_worktree_common_dir(git_dir: Path, dotgit: Path) -> Optional[Path]:
+    common_record = git_dir / "commondir"
+    backlink = git_dir / "gitdir"
+    if not common_record.exists() and not backlink.exists():
+        return None
+    if not common_record.is_file() or not backlink.is_file():
+        raise ReviewAuthorityError("incomplete linked worktree administrative layout")
+    common_raw = _bounded_git_text(common_record).strip()
+    if not common_raw:
+        raise ReviewAuthorityError("linked worktree has empty commondir")
+    common_dir = (git_dir / common_raw).resolve(strict=True)
+    back_path = Path(_bounded_git_text(backlink).strip())
+    if back_path.resolve(strict=True) != dotgit.resolve(strict=True):
+        raise ReviewAuthorityError("linked worktree backlink mismatch")
+    if git_dir.parent.parent.resolve(strict=True) != common_dir:
+        raise ReviewAuthorityError("linked worktree common-dir relationship mismatch")
+    return common_dir
+
+
+def _submodule_superproject_workspace(git_dir: Path) -> Optional[tuple[Path, tuple[str, ...]]]:
+    current = git_dir
+    while current.parent != current:
+        if current.name == "modules":
+            relative = git_dir.relative_to(current)
+            groups: list[str] = []
+            pending: list[str] = []
+            for part in relative.parts:
+                if part == "modules":
+                    if not pending:
+                        return None
+                    groups.append(str(Path(*pending)))
+                    pending = []
+                else:
+                    pending.append(part)
+            if pending:
+                groups.append(str(Path(*pending)))
+            if not groups:
+                return None
+            super_admin = current.parent
+            if super_admin.name == ".git" and super_admin.is_dir():
+                return super_admin.parent.resolve(strict=True), tuple(groups)
+            backlink = super_admin / "gitdir"
+            if backlink.is_file() and (super_admin / "commondir").is_file():
+                dotgit = Path(_bounded_git_text(backlink).strip()).resolve(strict=True)
+                _linked_worktree_common_dir(super_admin, dotgit)
+                return dotgit.parent.resolve(strict=True), tuple(groups)
+        current = current.parent
+    return None
+
+
+def _parse_gitlink_index_oid(output: bytes, expected_path: bytes, oid_length: int) -> bytes:
+    records = output.split(b"\0")
+    if not records or records[-1] != b"":
+        raise ReviewAuthorityError("workspace is not a registered submodule with a unique stage-0 gitlink record")
+    records.pop()
+    stage_zero: list[bytes] = []
+    for record in records:
+        metadata, separator, record_path = record.partition(b"\t")
+        fields = metadata.split(b" ")
+        if not separator or len(fields) != 3:
+            raise ReviewAuthorityError("workspace has a malformed gitlink index record")
+        mode, oid, stage = fields
+        if record_path != expected_path or mode != b"160000" or stage != b"0":
+            raise ReviewAuthorityError("workspace is not a registered submodule with a unique stage-0 gitlink record")
+        if len(oid) != oid_length or re.fullmatch(rb"[0-9a-fA-F]+", oid) is None:
+            raise ReviewAuthorityError("submodule gitlink has an invalid object id")
+        stage_zero.append(oid.lower())
+    if len(stage_zero) != 1:
+        raise ReviewAuthorityError("workspace is not a registered submodule with a unique stage-0 gitlink record")
+    return stage_zero[0]
+
+
+def _trusted_gitmodules_blob(
+    parent_git_dir: Path, parent_workspace: Path, env: dict[str, str]
+) -> bytes:
+    """Return committed .gitmodules bytes only when index and worktree agree."""
+
+    def run(*arguments: str) -> subprocess.CompletedProcess[bytes]:
+        try:
+            return subprocess.run(
+                [
+                    "git", "--no-optional-locks", "-c", "core.fsmonitor=false",
+                    "-c", "core.untrackedCache=false", "-c", f"core.hooksPath={os.devnull}",
+                    f"--git-dir={parent_git_dir}", f"--work-tree={parent_workspace}",
+                    *arguments,
+                ],
+                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=_REVIEW_GIT_SNAPSHOT_MAX_SECONDS, check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ReviewAuthorityError("registered submodule verification failed") from exc
+
+    object_format = run("rev-parse", "--show-object-format")
+    format_name = object_format.stdout.strip().lower()
+    oid_length = 40 if format_name == b"sha1" else 64 if format_name == b"sha256" else 0
+    if object_format.returncode != 0 or oid_length == 0:
+        raise ReviewAuthorityError("workspace is not a registered submodule")
+
+    head = run("ls-tree", "-z", "HEAD", "--", ".gitmodules")
+    index = run("ls-files", "--stage", "-z", "--", ".gitmodules")
+    expected_path = b".gitmodules"
+    head_records = head.stdout.split(b"\0")
+    index_records = index.stdout.split(b"\0")
+    if (
+        head.returncode != 0 or index.returncode != 0
+        or len(head.stdout) > 4096 or len(index.stdout) > 4096
+        or not head_records or head_records[-1] != b""
+        or not index_records or index_records[-1] != b""
+    ):
+        raise ReviewAuthorityError("workspace is not a registered submodule")
+    head_records.pop()
+    index_records.pop()
+    if len(head_records) != 1 or len(index_records) != 1:
+        raise ReviewAuthorityError("workspace is not a registered submodule")
+
+    head_meta, head_sep, head_path = head_records[0].partition(b"\t")
+    index_meta, index_sep, index_path = index_records[0].partition(b"\t")
+    head_fields = head_meta.split(b" ")
+    index_fields = index_meta.split(b" ")
+    if (
+        not head_sep or not index_sep
+        or head_path != expected_path or index_path != expected_path
+        or len(head_fields) != 3 or len(index_fields) != 3
+        or head_fields[0] not in {b"100644", b"100755"}
+        or index_fields[0] not in {b"100644", b"100755"}
+        or index_fields[2] != b"0"
+    ):
+        raise ReviewAuthorityError("workspace is not a registered submodule")
+    head_oid = head_fields[2].lower()
+    index_oid = index_fields[1].lower()
+    if (
+        len(head_oid) != oid_length or len(index_oid) != oid_length
+        or re.fullmatch(rb"[0-9a-f]+", head_oid) is None
+        or re.fullmatch(rb"[0-9a-f]+", index_oid) is None
+        or head_oid != index_oid
+    ):
+        raise ReviewAuthorityError("workspace is not a registered submodule")
+
+    gitmodules = parent_workspace / ".gitmodules"
+    try:
+        worktree_stat = gitmodules.lstat()
+        worktree_bytes = gitmodules.read_bytes()
+    except OSError as exc:
+        raise ReviewAuthorityError("workspace is not a registered submodule") from exc
+    index_executable = index_fields[0] == b"100755"
+    worktree_executable = bool(worktree_stat.st_mode & 0o111)
+    if (
+        not gitmodules.is_file()
+        or gitmodules.is_symlink()
+        or worktree_executable != index_executable
+    ):
+        raise ReviewAuthorityError("workspace is not a registered submodule")
+
+    blob = run("cat-file", "blob", os.fsdecode(head_oid))
+    if (
+        blob.returncode != 0
+        or len(blob.stdout) > _REVIEW_GIT_METADATA_MAX_BYTES
+        or blob.stdout != worktree_bytes
+        or worktree_stat.st_size != len(worktree_bytes)
+    ):
+        raise ReviewAuthorityError("workspace is not a registered submodule")
+    return blob.stdout
+
+
+def _trusted_submodule_common_dir(workspace: Path, git_dir: Path) -> Path:
+    relationship = _submodule_superproject_workspace(git_dir)
+    if relationship is None:
+        raise ReviewAuthorityError("untrusted Git workspace .git file target")
+    super_workspace, relative_paths = relationship
+    env = {
+        "PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", ""),
+        "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
+        "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0",
+    }
+    base = [
+        "git", "--no-optional-locks", "-c", "core.fsmonitor=false",
+        "-c", "core.untrackedCache=false", "-c", f"core.hooksPath={os.devnull}",
+        f"--git-dir={git_dir}", f"--work-tree={workspace}",
+    ]
+
+    # A path under ``.git/modules`` is only an administrative convention: an
+    # unrelated repository can be cloned there with ``--separate-git-dir``.
+    # Bind every path component to the corresponding stage-0 gitlink in its
+    # immediate superproject index.  Walking one index at a time is required
+    # for nested submodules because a superproject index never contains its
+    # descendants' gitlinks.
+    root_layout = _trusted_git_layout(super_workspace)
+    if root_layout is None:
+        raise ReviewAuthorityError("Git submodule superproject is not a repository")
+    parent_workspace = super_workspace
+    parent_git_dir, _root_common_dir = root_layout
+    for depth, logical_name in enumerate(relative_paths):
+        gitmodules_bytes = _trusted_gitmodules_blob(parent_git_dir, parent_workspace, env)
+        parser_input: Optional[Path] = None
+        try:
+            with tempfile.NamedTemporaryFile(prefix="hermes-gitmodules-", delete=False) as temp:
+                temp.write(gitmodules_bytes)
+                parser_input = Path(temp.name)
+            mapping = subprocess.run(
+                [
+                    "git", "--no-optional-locks", "config", "--no-includes", "--null",
+                    "--file", str(parser_input), "--get-regexp", r"^submodule\..*\.path$",
+                ],
+                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=_REVIEW_GIT_SNAPSHOT_MAX_SECONDS, check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ReviewAuthorityError("registered submodule verification failed") from exc
+        finally:
+            if parser_input is not None:
+                try:
+                    parser_input.unlink()
+                except OSError:
+                    pass
+        if (
+            mapping.returncode != 0
+            or len(mapping.stdout) > 4096
+        ):
+            raise ReviewAuthorityError("workspace is not a registered submodule")
+        mappings: dict[str, str] = {}
+        mapped_paths: set[str] = set()
+        for record in mapping.stdout.split(b"\0"):
+            if not record:
+                continue
+            key, separator, value = record.partition(b"\n")
+            try:
+                decoded_key = key.decode("utf-8")
+                decoded_value = os.fsdecode(value)
+            except (UnicodeDecodeError, UnicodeEncodeError) as exc:
+                raise ReviewAuthorityError("malformed .gitmodules mapping") from exc
+            prefix, suffix = "submodule.", ".path"
+            if (
+                not separator
+                or not decoded_key.startswith(prefix)
+                or not decoded_key.endswith(suffix)
+            ):
+                raise ReviewAuthorityError("malformed .gitmodules mapping")
+            name = decoded_key[len(prefix):-len(suffix)]
+            if not name or name in mappings or decoded_value in mapped_paths:
+                raise ReviewAuthorityError("ambiguous .gitmodules mapping")
+            mappings[name] = decoded_value
+            mapped_paths.add(decoded_value)
+        relative_path = mappings.get(logical_name)
+        if relative_path is None:
+            raise ReviewAuthorityError("workspace is not a registered submodule")
+        path_parts = Path(relative_path).parts
+        if not path_parts or any(part in {"", ".", "..", "modules"} for part in path_parts):
+            raise ReviewAuthorityError("Git submodule administrative relationship mismatch")
+        try:
+            proc = subprocess.run(
+                [
+                    "git", "--no-optional-locks", "-c", "core.fsmonitor=false",
+                    "-c", "core.untrackedCache=false", "-c", f"core.hooksPath={os.devnull}",
+                    f"--git-dir={parent_git_dir}", f"--work-tree={parent_workspace}",
+                    "ls-files", "--stage", "-z", "--", relative_path,
+                ],
+                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=_REVIEW_GIT_SNAPSHOT_MAX_SECONDS, check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ReviewAuthorityError("registered submodule verification failed") from exc
+        if proc.returncode != 0 or len(proc.stdout) > 4096:
+            raise ReviewAuthorityError("workspace is not a registered submodule")
+        raw_path = os.fsencode(relative_path)
+
+        def exact_git_output(
+            repository_git_dir: Path, repository_workspace: Path, *arguments: str
+        ) -> bytes:
+            try:
+                result = subprocess.run(
+                    [
+                        "git", "--no-optional-locks", "-c", "core.fsmonitor=false",
+                        "-c", "core.untrackedCache=false", "-c", f"core.hooksPath={os.devnull}",
+                        f"--git-dir={repository_git_dir}",
+                        f"--work-tree={repository_workspace}", *arguments,
+                    ],
+                    env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    timeout=_REVIEW_GIT_SNAPSHOT_MAX_SECONDS, check=False,
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise ReviewAuthorityError("submodule gitlink HEAD verification failed") from exc
+            output = result.stdout.strip().lower()
+            if result.returncode != 0 or len(output) > 128:
+                raise ReviewAuthorityError("submodule gitlink HEAD verification failed")
+            return output
+
+        object_format = exact_git_output(
+            parent_git_dir, parent_workspace, "rev-parse", "--show-object-format"
+        )
+        oid_length = 40 if object_format == b"sha1" else 64 if object_format == b"sha256" else 0
+        if oid_length == 0:
+            raise ReviewAuthorityError("submodule gitlink has an invalid object id")
+        index_oid = _parse_gitlink_index_oid(proc.stdout, raw_path, oid_length)
+        child_workspace = parent_workspace / relative_path
+        expected_child_git_dir = (parent_git_dir / "modules" / logical_name).resolve(strict=True)
+        child_git_dir = git_dir if depth == len(relative_paths) - 1 else expected_child_git_dir
+        if child_git_dir != expected_child_git_dir:
+            raise ReviewAuthorityError("Git submodule administrative relationship mismatch")
+        child_format = exact_git_output(
+            child_git_dir, child_workspace, "rev-parse", "--show-object-format"
+        )
+        child_head = exact_git_output(
+            child_git_dir, child_workspace, "rev-parse", "--verify", "HEAD^{commit}"
+        )
+        if (
+            child_format != object_format
+            or len(child_head) != oid_length
+            or re.fullmatch(rb"[0-9a-f]+", child_head) is None
+            or child_head != index_oid
+        ):
+            raise ReviewAuthorityError("submodule gitlink OID does not match child HEAD")
+
+        registration = subprocess.run(
+            [
+                "git", "--no-optional-locks", "-c", "core.fsmonitor=false",
+                f"--git-dir={parent_git_dir}", "config", "--local", "--get",
+                f"submodule.{logical_name}.url",
+            ],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=_REVIEW_GIT_SNAPSHOT_MAX_SECONDS, check=False,
+        )
+        if registration.returncode != 0 or not registration.stdout or len(registration.stdout) > 4096:
+            raise ReviewAuthorityError("workspace is not a registered submodule")
+        parent_workspace = parent_workspace / relative_path
+        parent_git_dir = child_git_dir
+    if parent_workspace.resolve(strict=True) != workspace:
+        raise ReviewAuthorityError("Git submodule administrative relationship mismatch")
+
+    def rev_parse(argument: str) -> Path:
+        try:
+            proc = subprocess.run(
+                [*base, "rev-parse", "--path-format=absolute", argument], env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                timeout=_REVIEW_GIT_SNAPSHOT_MAX_SECONDS, check=False,
+            )
+            if proc.returncode != 0 or len(proc.stdout.encode("utf-8")) > 4096:
+                raise ReviewAuthorityError("Git submodule verification failed")
+            return Path(proc.stdout.strip()).resolve(strict=True)
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            raise ReviewAuthorityError("Git submodule verification failed") from exc
+
+    if rev_parse("--show-toplevel") != workspace:
+        raise ReviewAuthorityError("Git submodule command escaped the trusted workspace")
+    common_dir = rev_parse("--git-common-dir")
+    if common_dir != git_dir:
+        raise ReviewAuthorityError("Git submodule common-dir relationship mismatch")
+    return common_dir
+
+
+def _trusted_git_layout(workspace: Path) -> Optional[tuple[Path, Path]]:
+    dotgit = workspace / ".git"
+    if not dotgit.exists():
+        return None
+    if dotgit.is_dir():
+        git_dir = dotgit.resolve(strict=True)
+        common_dir = git_dir
+    elif dotgit.is_file():
+        git_dir = _git_dir_from_file(dotgit)
+        common_dir = _linked_worktree_common_dir(git_dir, dotgit)
+        if common_dir is None:
+            common_dir = _trusted_submodule_common_dir(workspace, git_dir)
+    else:
+        raise ReviewAuthorityError("malformed Git workspace .git entry")
+    if not (git_dir / "HEAD").exists() or not (common_dir / "objects").is_dir():
+        raise ReviewAuthorityError("incomplete Git repository structure")
+    if not ((common_dir / "refs").is_dir() or (common_dir / "packed-refs").is_file()):
+        raise ReviewAuthorityError("Git repository has no refs authority")
+    return git_dir, common_dir
+
+
+def _path_identity(path: Path) -> tuple[str, int, int]:
+    resolved = path.resolve(strict=True)
+    st = resolved.stat()
+    return str(resolved), int(st.st_dev), int(st.st_ino)
+
+
+def _repository_git_dir(worktree: Path) -> Path:
+    dotgit = worktree / ".git"
+    if dotgit.is_dir():
+        git_dir = dotgit.resolve(strict=True)
+    elif dotgit.is_file():
+        layout = _trusted_git_layout(worktree)
+        if layout is None:
+            raise ReviewAuthorityError("Git repository layout disappeared during snapshot")
+        git_dir = layout[0]
+    else:
+        raise ReviewAuthorityError("Git repository layout disappeared during snapshot")
+    if not (git_dir / "HEAD").exists():
+        raise ReviewAuthorityError("incomplete Git repository structure")
+    return git_dir
+
+
+def _capture_trusted_git_snapshot(workspace: Path) -> Optional[dict[str, object]]:
+    layout = _trusted_git_layout(workspace)
+    if layout is None:
+        return None
+    git_dir, common_dir = layout
+    identities = {
+        "workspace": _path_identity(workspace),
+        "git_dir": _path_identity(git_dir),
+        "common_dir": _path_identity(common_dir),
+    }
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": os.environ.get("HOME", ""),
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_PAGER": "cat",
+        "PAGER": "cat",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+    safe_git_options = (
+        "--no-optional-locks",
+        "-c", "core.fsmonitor=false",
+        "-c", "core.untrackedCache=false",
+        "-c", f"core.hooksPath={os.devnull}",
+    )
+    started = time.monotonic()
+
+    def remaining_timeout() -> float:
+        remaining = _REVIEW_GIT_SNAPSHOT_MAX_SECONDS - (time.monotonic() - started)
+        if remaining <= 0:
+            raise ReviewAuthorityError("Git working snapshot time limit exceeded")
+        return remaining
+
+    def run_process(
+        repository: Path | bytes, args: tuple[str | bytes, ...], *, text: bool = False
+    ) -> subprocess.CompletedProcess:
+        use_bytes = isinstance(repository, bytes)
+        encode = os.fsencode if use_bytes else str
+        repository_path = Path(os.fsdecode(repository)).resolve(strict=True)
+        repository_git_dir = _repository_git_dir(repository_path)
+        git_dir_option = encode(f"--git-dir={repository_git_dir}")
+        work_tree_option = encode(f"--work-tree={repository_path}")
+        argv = [
+            encode("git"),
+            *(encode(arg) for arg in safe_git_options),
+            git_dir_option,
+            work_tree_option,
+            *args,
+        ]
+        try:
+            proc = subprocess.run(
+                argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=text, timeout=remaining_timeout(), check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ReviewAuthorityError("Git working snapshot time limit exceeded") from exc
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ReviewAuthorityError("Git snapshot command failed") from exc
+        remaining_timeout()
+        for name, expected in identities.items():
+            current_path = workspace if name == "workspace" else (
+                _trusted_git_layout(workspace) or (None, None)
+            )[{"git_dir": 0, "common_dir": 1}.get(name, 0)]
+            if current_path is None or _path_identity(Path(current_path)) != expected:
+                raise ReviewAuthorityError("Git workspace changed during snapshot")
+        top_level = subprocess.run(
+            [
+                encode("git"),
+                *(encode(arg) for arg in safe_git_options),
+                git_dir_option,
+                work_tree_option,
+                encode("rev-parse"),
+                encode("--show-toplevel"),
+            ],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=False,
+            timeout=remaining_timeout(),
+            check=False,
+        )
+        remaining_timeout()
+        if (
+            top_level.returncode != 0
+            or Path(os.fsdecode(top_level.stdout.rstrip(b"\r\n"))).resolve(strict=True)
+            != repository_path
+        ):
+            raise ReviewAuthorityError("Git command escaped the trusted workspace")
+        return proc
+
+    def run(*args: str) -> str:
+        proc = run_process(workspace, args, text=True)
+        if proc.returncode != 0 or len(proc.stdout.encode("utf-8")) > 4096:
+            raise ReviewAuthorityError("Git snapshot command failed")
+        return proc.stdout.strip()
+
+    def run_bytes(*args: str) -> bytes:
+        proc = run_process(workspace, args)
+        if proc.returncode != 0 or len(proc.stdout) > _REVIEW_GIT_METADATA_MAX_BYTES:
+            raise ReviewAuthorityError("Git working snapshot metadata limit exceeded")
+        return proc.stdout
+
+    def reject_dirty_submodules() -> None:
+        pending = [os.fsencode(workspace)]
+        seen: set[bytes] = set()
+        item_count = 0
+        output_bytes = 0
+        while pending:
+            if time.monotonic() - started > _REVIEW_GIT_SNAPSHOT_MAX_SECONDS:
+                raise ReviewAuthorityError("Git working snapshot time limit exceeded")
+            repository = pending.pop()
+            if repository in seen:
+                raise ReviewAuthorityError("Git submodule inspection cycle detected")
+            seen.add(repository)
+            status_proc = run_process(
+                repository,
+                (b"status", b"--porcelain=v2", b"-z", b"--untracked-files=all",
+                 b"--ignore-submodules=none"),
+            )
+            links_proc = run_process(
+                repository, (b"ls-files", b"--stage", b"-z")
+            )
+            output_bytes += len(status_proc.stdout) + len(links_proc.stdout)
+            if (
+                status_proc.returncode != 0
+                or links_proc.returncode != 0
+                or output_bytes > _REVIEW_GIT_METADATA_MAX_BYTES
+            ):
+                raise ReviewAuthorityError("Git submodule inspection failed or exceeded output limit")
+            if repository != os.fsencode(workspace) and status_proc.stdout:
+                raise ReviewAuthorityError("review authority rejects a dirty submodule")
+            for record in links_proc.stdout.split(b"\0"):
+                if not record.startswith(b"160000 ") or b"\t" not in record:
+                    continue
+                raw_path = record.split(b"\t", 1)[1]
+                item_count += 1
+                if item_count > _REVIEW_GIT_SNAPSHOT_MAX_ITEMS:
+                    raise ReviewAuthorityError("Git submodule inspection item limit exceeded")
+                child = os.path.normpath(os.path.join(repository, raw_path))
+                if os.path.commonpath((repository, child)) != repository:
+                    raise ReviewAuthorityError("Git submodule inspection returned an unsafe path")
+                if os.path.exists(os.path.join(child, b".git")):
+                    pending.append(child)
+
+    object_format = run("rev-parse", "--show-object-format")
+    revision = run("rev-parse", "--verify", "HEAD^{commit}").lower()
+    expected_len = 40 if object_format == "sha1" else 64 if object_format == "sha256" else 0
+    if expected_len == 0 or not re.fullmatch(f"[0-9a-f]{{{expected_len}}}", revision):
+        raise ReviewAuthorityError("Git returned an invalid commit id")
+    run("cat-file", "-e", f"{revision}^{{commit}}")
+    if run("rev-parse", "--verify", "HEAD^{commit}").lower() != revision:
+        raise ReviewAuthorityError("Git HEAD changed during snapshot")
+
+    reject_dirty_submodules()
+    status = run_bytes(
+        "status", "--porcelain=v2", "-z", "--untracked-files=all",
+        "--ignore-submodules=none",
+    )
+    digest = hashlib.sha256()
+    digest.update(b"trusted-git-working-snapshot-v2\0")
+    digest.update(len(status).to_bytes(8, "big"))
+    digest.update(status)
+    content_bytes = 0
+    metadata_bytes = len(status)
+    item_count = 0
+    pending = [workspace]
+    entries: list[tuple[bytes, Path]] = []
+    while pending:
+        if time.monotonic() - started > _REVIEW_GIT_SNAPSHOT_MAX_SECONDS:
+            raise ReviewAuthorityError("Git working snapshot time limit exceeded")
+        directory = pending.pop()
+        try:
+            children = sorted(
+                os.scandir(directory), key=lambda entry: os.fsencode(entry.name)
+            )
+        except OSError as exc:
+            raise ReviewAuthorityError("Git working snapshot walk failed") from exc
+        for child in children:
+            target = Path(child.path)
+            relative = target.relative_to(workspace)
+            # Git administrative entries are outside the reviewed worktree
+            # payload, including the .git files inside checked-out submodules.
+            if relative.name == ".git":
+                continue
+            raw_path = os.fsencode(str(relative))
+            item_count += 1
+            metadata_bytes += len(raw_path) + 16
+            if item_count > _REVIEW_GIT_SNAPSHOT_MAX_ITEMS:
+                raise ReviewAuthorityError("Git working snapshot item limit exceeded")
+            if metadata_bytes > _REVIEW_GIT_METADATA_MAX_BYTES:
+                raise ReviewAuthorityError("Git working snapshot metadata limit exceeded")
+            entries.append((raw_path, target))
+            try:
+                if child.is_dir(follow_symlinks=False):
+                    pending.append(target)
+            except OSError as exc:
+                raise ReviewAuthorityError("Git working snapshot walk failed") from exc
+
+    for raw_path, target in sorted(entries, key=lambda item: item[0]):
+        if time.monotonic() - started > _REVIEW_GIT_SNAPSHOT_MAX_SECONDS:
+            raise ReviewAuthorityError("Git working snapshot time limit exceeded")
+        digest.update(len(raw_path).to_bytes(8, "big"))
+        digest.update(raw_path)
+        try:
+            st = target.lstat()
+        except OSError as exc:
+            raise ReviewAuthorityError("Git workspace changed during snapshot") from exc
+        digest.update(int(st.st_mode).to_bytes(8, "big"))
+        if target.is_symlink():
+            try:
+                payload = os.fsencode(os.readlink(target))
+            except OSError as exc:
+                raise ReviewAuthorityError("Git workspace changed during snapshot") from exc
+            content_bytes += len(payload)
+            if content_bytes > _REVIEW_GIT_SNAPSHOT_MAX_BYTES:
+                raise ReviewAuthorityError("Git working snapshot byte limit exceeded")
+            digest.update(len(payload).to_bytes(8, "big"))
+            digest.update(payload)
+        elif target.is_file():
+            digest.update(int(st.st_size).to_bytes(8, "big"))
+            try:
+                with target.open("rb") as handle:
+                    while chunk := handle.read(1024 * 1024):
+                        content_bytes += len(chunk)
+                        if content_bytes > _REVIEW_GIT_SNAPSHOT_MAX_BYTES:
+                            raise ReviewAuthorityError("Git working snapshot byte limit exceeded")
+                        digest.update(chunk)
+                        if time.monotonic() - started > _REVIEW_GIT_SNAPSHOT_MAX_SECONDS:
+                            raise ReviewAuthorityError("Git working snapshot time limit exceeded")
+            except OSError as exc:
+                raise ReviewAuthorityError("Git workspace changed during snapshot") from exc
+        else:
+            digest.update(b"non-file\0")
+
+    if run("rev-parse", "--verify", "HEAD^{commit}").lower() != revision:
+        raise ReviewAuthorityError("Git HEAD changed during snapshot")
+    return {
+        "inspected_revision": revision,
+        "git_snapshot_digest": digest.hexdigest(),
+        "workspace": identities["workspace"],
+        "git_dir": identities["git_dir"],
+        "common_dir": identities["common_dir"],
+    }
+
+
+def bind_review_run_authority(
+    conn: sqlite3.Connection, task_id: str, workspace: Path | str
+) -> dict[str, object]:
+    task = get_task(conn, task_id)
+    if task is None or task.status != "running" or task.current_run_id is None:
+        raise ReviewAuthorityError("review authority requires a current running run")
+    role = (task.current_step_key or task.assignee or "").strip().lower()
+    if not _is_jerome_workflow_task(task) or role not in {"architect", "critic"}:
+        raise ReviewAuthorityError("review authority applies only to strict review roles")
+    workspace_path = Path(workspace).expanduser().resolve(strict=True)
+    if not workspace_path.is_dir():
+        raise ReviewAuthorityError("review workspace must be a directory")
+    subject_json, subject_digest = _review_subject(conn, task)
+    git = _capture_trusted_git_snapshot(workspace_path)
+    subject_kind = "git_workspace_head_v1" if git else "task_snapshot_v1"
+    inspected_revision = str(git["inspected_revision"]) if git else subject_digest
+    git_snapshot_digest = str(git["git_snapshot_digest"]) if git else None
+    workspace_ident = git["workspace"] if git else _path_identity(workspace_path)
+    git_ident = git["git_dir"] if git else (None, None, None)
+    common_ident = git["common_dir"] if git else (None, None, None)
+    row_values = (
+        int(task.current_run_id), task.id, task.assignee or role, role,
+        _REVIEW_AUTHORITY_MODE, _REVIEW_THREAT_MODEL, subject_kind,
+        task.subject_version, subject_json, subject_digest, inspected_revision,
+        git_snapshot_digest,
+        *workspace_ident, *git_ident, *common_ident, int(time.time()),
+    )
+    try:
+        with write_txn(conn):
+            conn.execute(
+                """INSERT INTO review_run_authority (
+                    run_id, task_id, reviewer_profile, role, authority_mode,
+                    threat_model, subject_kind, subject_version, subject_json,
+                    subject_digest, inspected_revision, git_snapshot_digest,
+                    workspace_realpath, workspace_dev, workspace_ino,
+                    git_dir_realpath, git_dir_dev, git_dir_ino,
+                    common_dir_realpath, common_dir_dev, common_dir_ino, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                row_values,
+            )
+    except sqlite3.IntegrityError as exc:
+        raise ReviewAuthorityError("review authority is already bound for this run") from exc
+    return get_review_run_authority(conn, task.current_run_id) or {}
+
+
+def get_review_run_authority(
+    conn: sqlite3.Connection, run_id: Optional[int]
+) -> Optional[dict[str, object]]:
+    if run_id is None:
+        return None
+    row = conn.execute(
+        "SELECT * FROM review_run_authority WHERE run_id = ?", (int(run_id),)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def update_task_subject(
+    conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
+    body: Optional[str] = None,
+) -> bool:
+    if title is not None and not title.strip():
+        raise ValueError("title cannot be blank")
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT title, body FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        new_title = title.strip() if title is not None else row["title"]
+        new_body = body if body is not None else row["body"]
+        if new_title == row["title"] and new_body == row["body"]:
+            return True
+        active = conn.execute(
+            "SELECT 1 FROM review_run_authority a JOIN task_runs r ON r.id=a.run_id "
+            "JOIN tasks t ON t.id=a.task_id WHERE a.task_id=? "
+            "AND t.current_run_id=a.run_id AND r.ended_at IS NULL",
+            (task_id,),
+        ).fetchone()
+        if active:
+            raise ReviewAuthorityError("cannot mutate subject during active review")
+        conn.execute(
+            "UPDATE tasks SET title=?, body=?, subject_version=subject_version+1 WHERE id=?",
+            (new_title, new_body, task_id),
+        )
+        _append_event(conn, task_id, "edited", None)
+        return True
+
+
 # Canonical sort-order mappings for ``hermes kanban list --sort``.
 # Each value is a raw SQL fragment appended after ``ORDER BY``.
 VALID_SORT_ORDERS: dict[str, str] = {
@@ -3643,7 +4548,9 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
 # ---------------------------------------------------------------------------
 
 def add_comment(
-    conn: sqlite3.Connection, task_id: str, author: str, body: str
+    conn: sqlite3.Connection, task_id: str, author: str, body: str,
+    *, expected_run_id: Optional[int] = None,
+    reviewer_profile: Optional[str] = None,
 ) -> int:
     if not body or not body.strip():
         raise ValueError("comment body is required")
@@ -3651,14 +4558,48 @@ def add_comment(
         raise ValueError("comment author is required")
     now = int(time.time())
     with write_txn(conn):
-        if not conn.execute(
-            "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
-        ).fetchone():
+        task_row = conn.execute(
+            "SELECT current_run_id, status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not task_row:
             raise ValueError(f"unknown task {task_id}")
+        bound_run_id: Optional[int] = None
+        if expected_run_id is not None or reviewer_profile is not None:
+            if expected_run_id is None or not reviewer_profile:
+                raise ValueError("run-bound comment requires run id and reviewer profile")
+            authority = conn.execute(
+                "SELECT reviewer_profile FROM review_run_authority "
+                "WHERE task_id = ? AND run_id = ?",
+                (task_id, int(expected_run_id)),
+            ).fetchone()
+            current_task = get_task(conn, task_id)
+            current_role = (
+                current_task.current_step_key or current_task.assignee or ""
+            ).strip().lower() if current_task else ""
+            strict_review = bool(
+                current_task
+                and _is_jerome_workflow_task(current_task)
+                and current_role in {"architect", "critic"}
+            )
+            if strict_review:
+                run = conn.execute(
+                    "SELECT profile, ended_at FROM task_runs WHERE id = ? AND task_id = ?",
+                    (int(expected_run_id), task_id),
+                ).fetchone()
+                if (
+                    task_row["status"] != "running"
+                    or task_row["current_run_id"] != int(expected_run_id)
+                    or authority is None or run is None or run["ended_at"] is not None
+                    or run["profile"] != reviewer_profile
+                    or authority["reviewer_profile"] != reviewer_profile
+                    or author.strip() != reviewer_profile
+                ):
+                    raise ValueError("comment does not match the current review run/profile")
+                bound_run_id = int(expected_run_id)
         cur = conn.execute(
-            "INSERT INTO task_comments (task_id, author, body, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (task_id, author.strip(), body.strip(), now),
+            "INSERT INTO task_comments (task_id, author, body, created_at, run_id) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (task_id, author.strip(), body.strip(), now, bound_run_id),
         )
         _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
         return int(cur.lastrowid or 0)
@@ -3676,6 +4617,7 @@ def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
             author=r["author"],
             body=r["body"],
             created_at=r["created_at"],
+            run_id=r["run_id"] if "run_id" in r.keys() else None,
         )
         for r in rows
     ]
@@ -3692,7 +4634,7 @@ def list_comments_after(
     ``tools.kanban_tools.inject_new_comments_from_env``).
     """
     rows = conn.execute(
-        "SELECT id, task_id, author, body, created_at FROM task_comments "
+        "SELECT id, task_id, author, body, created_at, run_id FROM task_comments "
         "WHERE task_id = ? AND id > ? ORDER BY id ASC",
         (task_id, int(after_id)),
     ).fetchall()
@@ -3703,6 +4645,7 @@ def list_comments_after(
             author=r["author"],
             body=r["body"],
             created_at=r["created_at"],
+            run_id=r["run_id"] if "run_id" in r.keys() else None,
         )
         for r in rows
     ]
@@ -4008,6 +4951,18 @@ def _end_run(
     if not row or not row["current_run_id"]:
         return None
     run_id = int(row["current_run_id"])
+    existing = conn.execute(
+        "SELECT metadata FROM task_runs WHERE id=?", (run_id,),
+    ).fetchone()
+    if existing and existing["metadata"]:
+        try:
+            merged_metadata = json.loads(existing["metadata"])
+        except (TypeError, json.JSONDecodeError):
+            merged_metadata = {}
+        if isinstance(merged_metadata, dict):
+            if metadata is not None:
+                merged_metadata.update(metadata)
+            metadata = merged_metadata
     conn.execute(
         """
         UPDATE task_runs
@@ -4028,7 +4983,7 @@ def _end_run(
             outcome,
             summary,
             error,
-            json.dumps(metadata, ensure_ascii=False) if metadata else None,
+            json.dumps(metadata, ensure_ascii=False) if metadata is not None else None,
             now,
             run_id,
         ),
@@ -4090,7 +5045,7 @@ def _synthesize_ended_run(
             task_id, profile, step_key,
             outcome, outcome,
             summary, error,
-            json.dumps(metadata, ensure_ascii=False) if metadata else None,
+            json.dumps(metadata, ensure_ascii=False) if metadata is not None else None,
             now, now,
         ),
     )
@@ -4132,11 +5087,11 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     """
     row = conn.execute(
         "SELECT kind FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
+        "WHERE task_id = ? AND kind IN ('blocked', 'review_blocked', 'unblocked') "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    return bool(row) and row["kind"] == "blocked"
+    return bool(row) and row["kind"] in {"blocked", "review_blocked"}
 
 
 def recompute_ready(
@@ -4847,6 +5802,37 @@ class RoleCompletionContractError(ValueError):
 _JEROME_WORKFLOW_TEMPLATE = "jerome-kanban-v1"
 _JEROME_WORKFLOW_MARKER = "WORKFLOW_CONTRACT: jerome-kanban-v1"
 _HEX_REVISION_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
+_IMMUTABLE_RUNTIME_LAUNCHER = r'''
+import os
+import runpy
+import sys
+
+object_root, manifest_sha256, cache_key, raw_bindings = sys.argv[1:5]
+worker_argv = sys.argv[5:]
+payload_root = os.path.join(object_root, "payload")
+sys.path[:] = [payload_root]
+from hermes_cli.kanban_runtime_snapshot import install_snapshot_bootstrap_capability, runtime_bindings_from_json, snapshot_runtime_sys_path, verify_published_snapshot, with_runtime_bindings
+spec = verify_published_snapshot(object_root, manifest_sha256, cache_key)
+spec = with_runtime_bindings(spec, runtime_bindings_from_json(raw_bindings))
+sys.path[:] = snapshot_runtime_sys_path(spec)
+install_snapshot_bootstrap_capability(spec)
+os.environ["HERMES_KANBAN_RUNTIME_ROOT"] = payload_root
+os.environ["HERMES_KANBAN_SNAPSHOT_CACHE_KEY"] = cache_key
+os.environ["PYTHONNOUSERSITE"] = "1"
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+for name in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONINSPECT"):
+    os.environ.pop(name, None)
+sys.argv = ["hermes", *worker_argv]
+runpy.run_module("hermes_cli.main", run_name="__main__", alter_sys=False)
+'''
+
+
+def _is_jerome_workflow_task(task: Task) -> bool:
+    """Recognize both immutable typed cards and the supported legacy marker."""
+    return (
+        task.workflow_template_id == _JEROME_WORKFLOW_TEMPLATE
+        or _JEROME_WORKFLOW_MARKER in (task.body or "")
+    )
 
 
 def _typed_verdict(summary: str, allowed: set[str]) -> Optional[str]:
@@ -4921,18 +5907,125 @@ def _task_repo_head(task: Task) -> Optional[str]:
     return proc.stdout.strip() if proc.returncode == 0 else None
 
 
+def _normalize_review_string_lists(meta: dict) -> dict:
+    normalized = json.loads(json.dumps(meta, ensure_ascii=False))
+    combined: dict[str, list[str]] = {}
+    for field_name in ("inspected_symbols", "red_tests"):
+        value = normalized.get(field_name)
+        if not isinstance(value, list) or not 1 <= len(value) <= 256:
+            raise RoleCompletionContractError(
+                f"review provenance {field_name} list bounds rejected"
+            )
+        items: list[str] = []
+        for item in value:
+            if not isinstance(item, str) or not item.strip():
+                raise RoleCompletionContractError(
+                    f"review provenance {field_name} string item rejected"
+                )
+            try:
+                item.encode("utf-8", errors="strict")
+            except UnicodeEncodeError as exc:
+                raise RoleCompletionContractError("review provenance Unicode rejected") from exc
+            item = unicodedata.normalize("NFC", item)
+            if any(unicodedata.category(ch) in {"Cc", "Cf", "Cs", "Zl", "Zp"} for ch in item):
+                raise RoleCompletionContractError("review provenance Unicode rejected")
+            if len(item.encode("utf-8")) > 1024:
+                raise RoleCompletionContractError("review provenance item size rejected")
+            items.append(item)
+        combined[field_name] = items
+        normalized[field_name] = items
+    canonical = json.dumps(combined, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    if len(canonical.encode("utf-8")) > 65_536:
+        raise RoleCompletionContractError("review provenance aggregate size rejected")
+    return normalized
+
+
+def _validate_review_provenance(
+    conn: sqlite3.Connection,
+    task: Task,
+    metadata: Optional[dict],
+) -> tuple[dict, dict[str, object]]:
+    meta = metadata if isinstance(metadata, dict) else {}
+    authority = get_review_run_authority(conn, task.current_run_id)
+    if authority is None:
+        raise RoleCompletionContractError(
+            "review provenance requires current review run authority"
+        )
+    subject_json, subject_digest = _review_subject(conn, task)
+    if (
+        authority["subject_json"] != subject_json
+        or authority["subject_digest"] != subject_digest
+        or int(authority["subject_version"]) != task.subject_version
+        or authority["reviewer_profile"] != task.assignee
+    ):
+        raise RoleCompletionContractError("review authority subject changed")
+    comment_id = meta.get("durable_comment_id")
+    if type(comment_id) is not int or comment_id <= 0:
+        raise RoleCompletionContractError(
+            "architect/critic completion requires review provenance with a positive durable_comment_id"
+        )
+    comment = conn.execute(
+        "SELECT body, author, run_id FROM task_comments WHERE id = ? AND task_id = ?",
+        (comment_id, task.id),
+    ).fetchone()
+    if comment is None or not (comment["body"] or "").strip():
+        raise RoleCompletionContractError(
+            "review provenance durable_comment_id must identify a non-empty comment on the same task"
+        )
+    if comment["run_id"] != task.current_run_id or comment["author"] != authority["reviewer_profile"]:
+        raise RoleCompletionContractError(
+            "review provenance comment must belong to the current review run/profile"
+        )
+    if meta.get("durable_comment_read_back") is not True:
+        raise RoleCompletionContractError("review provenance requires durable_comment_read_back=true")
+    revision = meta.get("inspected_revision")
+    if not isinstance(revision, str) or not _HEX_REVISION_RE.fullmatch(revision):
+        raise RoleCompletionContractError(
+            "review provenance requires a hexadecimal inspected_revision"
+        )
+    if revision != authority["inspected_revision"]:
+        raise RoleCompletionContractError("review provenance inspected_revision mismatch")
+    workspace = Path(str(authority["workspace_realpath"]))
+    try:
+        if _path_identity(workspace) != (
+            authority["workspace_realpath"], authority["workspace_dev"], authority["workspace_ino"]
+        ):
+            raise ReviewAuthorityError("workspace identity changed")
+        if authority["subject_kind"] == "git_workspace_head_v1":
+            current = _capture_trusted_git_snapshot(workspace)
+            if current is None or current["inspected_revision"] != revision:
+                raise ReviewAuthorityError("Git revision changed")
+            if current["git_snapshot_digest"] != authority["git_snapshot_digest"]:
+                raise ReviewAuthorityError("Git working snapshot changed")
+            if current["git_dir"] != (
+                authority["git_dir_realpath"], authority["git_dir_dev"], authority["git_dir_ino"]
+            ) or current["common_dir"] != (
+                authority["common_dir_realpath"], authority["common_dir_dev"], authority["common_dir_ino"]
+            ):
+                raise ReviewAuthorityError("Git repository identity changed")
+    except (OSError, ReviewAuthorityError) as exc:
+        raise RoleCompletionContractError("review authority workspace changed") from exc
+    normalized = _normalize_review_string_lists(meta)
+    machine = {
+        key: authority[key] for key in (
+            "run_id", "task_id", "reviewer_profile", "role", "authority_mode",
+            "threat_model", "subject_kind", "subject_version", "subject_digest",
+            "inspected_revision", "git_snapshot_digest", "workspace_realpath", "git_dir_realpath",
+            "common_dir_realpath", "created_at",
+        )
+    }
+    return normalized, machine
+
+
 def _validate_role_completion_contract(
+    conn: sqlite3.Connection,
     task: Task,
     *,
     summary: Optional[str],
     metadata: Optional[dict],
-) -> None:
-    typed = (
-        task.workflow_template_id == _JEROME_WORKFLOW_TEMPLATE
-        or _JEROME_WORKFLOW_MARKER in (task.body or "")
-    )
-    if not typed:
-        return
+) -> tuple[Optional[dict], Optional[dict[str, object]]]:
+    if not _is_jerome_workflow_task(task):
+        return metadata, None
     if task.status == "blocked":
         raise RoleCompletionContractError(
             "typed workflow blocked task must be explicitly unblocked before completion"
@@ -4941,13 +6034,15 @@ def _validate_role_completion_contract(
     role = (task.current_step_key or task.assignee or "").strip().lower()
     text = summary or ""
     meta = metadata if isinstance(metadata, dict) else {}
-
     valid_roles = {
         "planner", "orchestrator", "architect", "critic",
         "executor", "integrator", "verifier",
     }
     if role not in valid_roles:
         raise RoleCompletionContractError(f"unknown typed workflow role: {role!r}")
+    review_authority = None
+    if role in {"architect", "critic"}:
+        meta, review_authority = _validate_review_provenance(conn, task, metadata)
 
     if role == "critic":
         if _typed_verdict(text, {"OKAY", "ITERATE", "REJECT"}) != "OKAY":
@@ -4955,39 +6050,27 @@ def _validate_role_completion_contract(
                 "Critic verdict must be exactly one OKAY; ITERATE/REJECT must block"
             )
     elif role in {"architect", "verifier"}:
-        if _typed_verdict(text, {"CLEAR", "WATCH", "BLOCK"}) not in {"CLEAR", "WATCH"}:
-            raise RoleCompletionContractError(
-                f"{role} verdict must be exactly one CLEAR or WATCH"
-            )
+        verdict = _typed_verdict(text, {"CLEAR", "WATCH", "BLOCK"})
+        allowed_verdicts = {"CLEAR", "WATCH", "BLOCK"} if role == "architect" else {"CLEAR", "WATCH"}
+        if verdict not in allowed_verdicts:
+            raise RoleCompletionContractError(f"{role} verdict must be exactly one of {sorted(allowed_verdicts)}")
         if role == "verifier":
             reviewed = meta.get("reviewed_commit")
             integration_head = meta.get("integration_head")
             reviewer = meta.get("reviewer_identity")
             author = meta.get("author_identity")
-            if (
-                not isinstance(reviewed, str)
-                or not _HEX_REVISION_RE.fullmatch(reviewed)
-                or reviewed != integration_head
-            ):
-                raise RoleCompletionContractError(
-                    "verifier requires matching reviewed_commit and integration_head"
-                )
+            if not isinstance(reviewed, str) or not _HEX_REVISION_RE.fullmatch(reviewed) or reviewed != integration_head:
+                raise RoleCompletionContractError("verifier requires matching reviewed_commit and integration_head")
             if _task_repo_head(task) != reviewed:
-                raise RoleCompletionContractError(
-                    "verifier reviewed_commit must equal the task repository HEAD"
-                )
+                raise RoleCompletionContractError("verifier reviewed_commit must equal the task repository HEAD")
             if not isinstance(reviewer, str) or not reviewer.strip():
                 raise RoleCompletionContractError("verifier requires reviewer_identity")
             if not isinstance(author, str) or not author.strip():
                 raise RoleCompletionContractError("verifier requires author_identity")
             if author == reviewer:
-                raise RoleCompletionContractError(
-                    "verifier identity must differ from author_identity"
-                )
+                raise RoleCompletionContractError("verifier identity must differ from author_identity")
             if not _valid_verification_receipts(meta.get("verification"), reviewed):
-                raise RoleCompletionContractError(
-                    "verifier requires typed passing verification receipts"
-                )
+                raise RoleCompletionContractError("verifier requires typed passing verification receipts")
     elif role == "executor":
         revision = meta.get("commit") or meta.get("source_revision")
         if not isinstance(meta.get("changed_files"), list) or not meta["changed_files"]:
@@ -5003,23 +6086,15 @@ def _validate_role_completion_contract(
         commits = meta.get("included_commits")
         if not isinstance(revision, str) or not _HEX_REVISION_RE.fullmatch(revision):
             raise RoleCompletionContractError("integrator completion requires a hexadecimal integrated_head")
-        if not isinstance(commits, list) or not commits or not all(
-            isinstance(item, str) and _HEX_REVISION_RE.fullmatch(item) for item in commits
-        ):
+        if not isinstance(commits, list) or not commits or not all(isinstance(item, str) and _HEX_REVISION_RE.fullmatch(item) for item in commits):
             raise RoleCompletionContractError("integrator completion requires hexadecimal included_commits")
-        if not _revision_exists_in_task_repo(task, revision) or not all(
-            _revision_exists_in_task_repo(task, item) for item in commits
-        ):
-            raise RoleCompletionContractError(
-                "integrator revisions must exist in the task repository"
-            )
+        if not _revision_exists_in_task_repo(task, revision) or not all(_revision_exists_in_task_repo(task, item) for item in commits):
+            raise RoleCompletionContractError("integrator revisions must exist in the task repository")
         if _task_repo_head(task) != revision:
-            raise RoleCompletionContractError(
-                "integrator integrated_head must equal the task repository HEAD"
-            )
+            raise RoleCompletionContractError("integrator integrated_head must equal the task repository HEAD")
         if not _valid_verification_receipts(meta.get("verification"), revision):
             raise RoleCompletionContractError("integrator completion requires typed passing verification receipts")
-
+    return meta, review_authority
 
 def complete_task(
     conn: sqlite3.Connection,
@@ -5061,14 +6136,25 @@ def complete_task(
     """
     now = int(time.time())
 
-    task_for_contract = get_task(conn, task_id)
-    if task_for_contract is None:
-        return False
-    _validate_role_completion_contract(
-        task_for_contract,
-        summary=summary if summary is not None else result,
-        metadata=metadata,
-    )
+    if metadata is not None:
+        if not isinstance(metadata, dict):
+            raise TypeError(
+                f"metadata must be an object/dict, got {type(metadata).__name__}"
+            )
+        try:
+            metadata_json = json.dumps(
+                metadata,
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            normalized_metadata = json.loads(metadata_json)
+        except (TypeError, ValueError) as exc:
+            raise TypeError("metadata must be a JSON-safe object/dict") from exc
+        if normalized_metadata != metadata:
+            raise TypeError("metadata must contain only JSON-safe object values")
+        metadata = normalized_metadata
+    _reject_reserved_run_metadata(metadata)
+
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -5100,12 +6186,55 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    review_blocked = False
+    canonical_receipt = summary if summary is not None else result
     with write_txn(conn):
+        task_for_contract = get_task(conn, task_id)
+        if task_for_contract is None:
+            return False
+        if (
+            expected_run_id is not None
+            and task_for_contract.current_run_id != int(expected_run_id)
+        ):
+            return False
+        if _is_jerome_workflow_task(task_for_contract) and summary and result:
+            summary_verdict = _typed_verdict(
+                summary, {"OKAY", "ITERATE", "REJECT", "CLEAR", "WATCH", "BLOCK"}
+            )
+            result_verdict = _typed_verdict(
+                result, {"OKAY", "ITERATE", "REJECT", "CLEAR", "WATCH", "BLOCK"}
+            )
+            if summary_verdict != result_verdict:
+                raise RoleCompletionContractError(
+                    "conflicting typed workflow result and summary verdicts"
+                )
+        metadata, review_authority = _validate_role_completion_contract(
+            conn,
+            task_for_contract,
+            summary=canonical_receipt,
+            metadata=metadata,
+        )
+        if review_authority is not None:
+            metadata = dict(metadata or {})
+            metadata["review_authority"] = review_authority
+        role = (
+            task_for_contract.current_step_key
+            or task_for_contract.assignee
+            or ""
+        ).strip().lower()
+        review_blocked = (
+            _is_jerome_workflow_task(task_for_contract)
+            and role == "architect"
+            and _typed_verdict(canonical_receipt or "", {"CLEAR", "WATCH", "BLOCK"})
+            == "BLOCK"
+        )
+        target_status = "blocked" if review_blocked else "done"
+        stored_result = canonical_receipt if review_blocked else result
         if expected_run_id is None:
             cur = conn.execute(
                 """
                 UPDATE tasks
-                   SET status       = 'done',
+                   SET status       = ?,
                        result       = ?,
                        completed_at = ?,
                        claim_lock   = NULL,
@@ -5116,13 +6245,13 @@ def complete_task(
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked')
                 """,
-                (result, now, task_id),
+                (target_status, stored_result, now, task_id),
             )
         else:
             cur = conn.execute(
                 """
                 UPDATE tasks
-                   SET status       = 'done',
+                   SET status       = ?,
                        result       = ?,
                        completed_at = ?,
                        claim_lock   = NULL,
@@ -5134,7 +6263,7 @@ def complete_task(
                    AND status IN ('running', 'ready', 'blocked')
                    AND current_run_id = ?
                 """,
-                (result, now, task_id, int(expected_run_id)),
+                (target_status, stored_result, now, task_id, int(expected_run_id)),
             )
         if cur.rowcount != 1:
             return False
@@ -5152,8 +6281,9 @@ def complete_task(
                 )
         run_id = _end_run(
             conn, task_id,
-            outcome="completed", status="done",
-            summary=summary if summary is not None else result,
+            outcome="review_blocked" if review_blocked else "completed",
+            status="blocked" if review_blocked else "done",
+            summary=canonical_receipt,
             metadata=metadata,
         )
         # If complete_task was called on a never-claimed task (ready or
@@ -5163,8 +6293,8 @@ def complete_task(
         if run_id is None and (summary or metadata or result):
             run_id = _synthesize_ended_run(
                 conn, task_id,
-                outcome="completed",
-                summary=summary if summary is not None else result,
+                outcome="review_blocked" if review_blocked else "completed",
+                summary=canonical_receipt,
                 metadata=metadata,
             )
         # Carry the handoff summary in the event payload so gateway
@@ -5177,6 +6307,8 @@ def complete_task(
             "result_len": len(result) if result else 0,
             "summary": ev_summary or None,
         }
+        if metadata is not None:
+            completed_payload["metadata"] = metadata
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
         # Carry artifact paths in the event payload so the gateway
@@ -5194,10 +6326,21 @@ def complete_task(
                 if cleaned_artifacts:
                     completed_payload["artifacts"] = cleaned_artifacts
         _append_event(
-            conn, task_id, "completed",
+            conn, task_id, "review_blocked" if review_blocked else "completed",
             completed_payload,
             run_id=run_id,
         )
+    if review_blocked:
+        _blocked_task = get_task(conn, task_id)
+        _fire_kanban_lifecycle_hook(
+            "kanban_task_blocked",
+            task_id,
+            board=get_current_board(),
+            assignee=_blocked_task.assignee if _blocked_task else None,
+            run_id=run_id,
+            reason=canonical_receipt,
+        )
+        return True
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
     # its own txn so the completion itself is already durable by the
@@ -5818,6 +6961,7 @@ def block_task(
     *,
     reason: Optional[str] = None,
     kind: Optional[str] = None,
+    metadata: Optional[dict] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
@@ -5851,8 +6995,33 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    _reject_reserved_run_metadata(metadata)
     recurrences = 0
     with write_txn(conn):
+        if kind == "dependency":
+            task = get_task(conn, task_id)
+            role = (
+                (task.current_step_key or task.assignee or "").strip().lower()
+                if task is not None
+                else ""
+            )
+            if (
+                task is not None
+                and _is_jerome_workflow_task(task)
+                and role in {"architect", "critic", "verifier"}
+            ):
+                unfinished_parent = conn.execute(
+                    "SELECT 1 FROM task_links l "
+                    "JOIN tasks p ON p.id = l.parent_id "
+                    "WHERE l.child_id = ? "
+                    "AND p.status NOT IN ('done', 'archived') LIMIT 1",
+                    (task_id,),
+                ).fetchone()
+                if unfinished_parent is None:
+                    raise RoleCompletionContractError(
+                        "typed review verdict is an output: complete the review card; "
+                        "dependency block requires an unfinished declared parent"
+                    )
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
             (task_id,),
@@ -7045,6 +8214,48 @@ class DispatchResult:
     actively preventing two dispatchers from racing on ``kanban.db``."""
 
 
+@dataclass(frozen=True)
+class SpawnedWorker:
+    """Structured spawn result for launch probes and custom spawners."""
+
+    pid: int
+    returncode: Optional[int] = None
+    log_path: Optional[Path] = None
+    pid_committed: bool = False
+
+
+@dataclass(frozen=True)
+class WorkerRuntimeSpec:
+    """Hermes CLI argv plus a sealed runtime selected for one worker."""
+
+    argv: list[str]
+    env: dict[str, str] = field(default_factory=dict)
+    snapshot: Optional[Any] = None
+    lease: Optional[Any] = None
+    pass_fds: tuple[int, ...] = ()
+
+
+class WorkerRuntimeMismatch(RuntimeError):
+    """The live worker imported Hermes from outside its approved revision."""
+
+
+class ReservedRunMetadataError(ValueError):
+    """Caller metadata attempted to write a system-owned run field."""
+
+
+_RESERVED_RUN_METADATA_KEYS = frozenset({"runtime_provenance", "review_authority"})
+
+
+def _reject_reserved_run_metadata(metadata: Optional[dict]) -> None:
+    if not metadata:
+        return
+    collisions = sorted(_RESERVED_RUN_METADATA_KEYS.intersection(metadata))
+    if collisions:
+        raise ReservedRunMetadataError(
+            f"run metadata keys are reserved for the system: {', '.join(collisions)}"
+        )
+
+
 # Bounded registry of recently-reaped worker child exits, populated by the
 # reap loop at the top of ``dispatch_once`` and consulted by
 # ``detect_crashed_workers`` to classify a dead-pid task.
@@ -7774,67 +8985,16 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
 
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
-            rate_limited_exit = False
-            if kind == "clean_exit":
-                # Worker subprocess returned 0 but its task is still
-                # ``running`` in the DB — it exited without calling
-                # ``kanban_complete`` / ``kanban_block``. Overwhelmingly the
-                # work itself succeeded and only the paperwork was skipped, so
-                # a retry usually completes; the corrective sentence below is
-                # surfaced to the retry worker via the prior-attempt error in
-                # ``build_worker_context`` (guidance approach from #61817).
-                protocol_violation = True
-                error_text = (
-                    "worker exited cleanly (rc=0) without calling "
-                    "kanban_complete or kanban_block — protocol violation. "
-                    "If the prior run already did the work, verify it and "
-                    "report the result via kanban_complete; a run that ends "
-                    "without a terminal kanban call counts as failed no "
-                    "matter what it did."
-                )
-                event_kind = "protocol_violation"
-                event_payload = {
-                    "pid": pid,
-                    "claimer": row["claim_lock"],
-                    "exit_code": code,
-                    # Durable marker for _protocol_violation_streak: _end_run
-                    # copies this payload into the run metadata, which is how
-                    # the violation-only retry budget is derived later.
-                    "protocol_violation": True,
-                }
-            elif kind == "rate_limited":
-                # Worker bailed because the provider rate-limited / exhausted
-                # quota (EX_TEMPFAIL sentinel). This is NOT a task failure —
-                # the task is fine, the account just hit a wall. Release it
-                # back to ``ready`` so the respawn guard defers it until the
-                # quota window clears, and crucially do NOT count a failure
-                # (skip ``_record_task_failure``) so a long quota window can't
-                # trip the circuit breaker and permanently block the card.
-                protocol_violation = False
-                rate_limited_exit = True
-                error_text = (
-                    f"pid {pid} exited rate-limited (quota wall) — "
-                    f"requeued without counting a failure"
-                )
-                event_kind = "rate_limited"
-                event_payload = {
-                    "pid": pid,
-                    "claimer": row["claim_lock"],
-                    "exit_code": code,
-                }
-            else:
-                protocol_violation = False
-                if kind == "nonzero_exit":
-                    error_text = f"pid {pid} exited with code {code}"
-                elif kind == "signaled":
-                    error_text = f"pid {pid} killed by signal {code}"
-                else:
-                    error_text = f"pid {pid} not alive"
-                event_kind = "crashed"
-                event_payload = {"pid": pid, "claimer": row["claim_lock"]}
-                if code is not None and kind != "unknown":
-                    event_payload["exit_kind"] = kind
-                    event_payload["exit_code"] = code
+            (
+                _run_outcome,
+                error_text,
+                event_kind,
+                event_payload,
+                protocol_violation,
+                rate_limited_exit,
+            ) = _worker_exit_record(
+                kind, code, pid=pid, claimer=row["claim_lock"],
+            )
 
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
@@ -7847,7 +9007,6 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 # Rate-limited requeues are a clean release, not a crash —
                 # record the run outcome as ``rate_limited`` so the board
                 # history doesn't show a phantom crash for a quota wall.
-                _run_outcome = "rate_limited" if rate_limited_exit else "crashed"
                 run_id = _end_run(
                     conn, row["id"],
                     outcome=_run_outcome, status=_run_outcome,
@@ -8042,12 +9201,13 @@ def _record_task_failure(
     blocked = False
     with write_txn(conn):
         row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries "
+            "SELECT consecutive_failures, status, max_retries, current_run_id "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
             return False
         failures = int(row["consecutive_failures"]) + 1
+        failed_run_id = row["current_run_id"]
 
         # Per-task override wins over both caller-supplied and default
         # thresholds. None (the common case) falls through.
@@ -8142,6 +9302,11 @@ def _record_task_failure(
                     run_id=run_id,
                 )
             # Timeout/crash path's caller already emitted its own event.
+        if release_claim and failed_run_id is not None:
+            conn.execute(
+                "DELETE FROM review_run_authority WHERE run_id = ?",
+                (int(failed_run_id),),
+            )
     return blocked
 
 
@@ -8163,6 +9328,190 @@ def _record_spawn_failure(
     )
 
 
+def _worker_log_tail(log_path: Optional[Path], *, limit: int = 2000) -> str:
+    """Read and redact a bounded worker-log suffix for durable diagnostics."""
+    if log_path is None:
+        return ""
+    try:
+        with open(log_path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - limit), os.SEEK_SET)
+            text = handle.read(limit).decode("utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+    from agent.redact import redact_sensitive_text
+
+    return redact_sensitive_text(text, force=True)
+
+
+def _classify_returncode(returncode: int) -> tuple[str, int]:
+    """Map ``Popen.returncode`` to the canonical worker exit taxonomy."""
+    code = int(returncode)
+    if code == 0:
+        return ("clean_exit", 0)
+    if code == KANBAN_RATE_LIMIT_EXIT_CODE:
+        return ("rate_limited", code)
+    if code < 0:
+        return ("signaled", abs(code))
+    return ("nonzero_exit", code)
+
+
+def _worker_exit_record(
+    kind: str,
+    code: Optional[int],
+    *,
+    pid: int,
+    claimer: Optional[str],
+    tail: str = "",
+) -> tuple[str, str, str, dict, bool, bool]:
+    """Return canonical outcome/error/event metadata for every exit observer."""
+    payload: dict[str, Any] = {"pid": int(pid), "claimer": claimer}
+    protocol_violation = False
+    rate_limited = False
+    if code is not None:
+        payload["exit_code"] = int(code)
+    if kind == "clean_exit":
+        protocol_violation = True
+        error = (
+            "worker exited cleanly (rc=0) without calling kanban_complete or "
+            "kanban_block — protocol violation. If the prior run already did "
+            "the work, verify it and report the result via kanban_complete; a "
+            "run that ends without a terminal kanban call counts as failed no "
+            "matter what it did."
+        )
+        event_kind = "protocol_violation"
+        payload["protocol_violation"] = True
+    elif kind == "rate_limited":
+        rate_limited = True
+        error = (
+            f"pid {pid} exited rate-limited (quota wall) — requeued without "
+            "counting a failure"
+        )
+        event_kind = "rate_limited"
+    elif kind == "nonzero_exit":
+        error = f"pid {pid} exited with code {code}"
+        event_kind = "crashed"
+        payload["exit_kind"] = kind
+    elif kind == "signaled":
+        error = f"pid {pid} killed by signal {code}"
+        event_kind = "crashed"
+        payload["exit_kind"] = kind
+    else:
+        error = f"pid {pid} not alive"
+        event_kind = "crashed"
+    if tail:
+        error = f"{error}: {tail}"
+    outcome = "rate_limited" if rate_limited else "crashed"
+    return outcome, error, event_kind, payload, protocol_violation, rate_limited
+
+
+def record_worker_exit(
+    task_id: str,
+    run_id: Optional[int],
+    pid: int,
+    returncode: int,
+    *,
+    log_path: Optional[Path] = None,
+    db_path: Optional[Path] = None,
+) -> bool:
+    """Promptly classify a detached child exit with a run/pid CAS guard."""
+    tail = _worker_log_tail(log_path)
+    kind, code = _classify_returncode(returncode)
+    with connect_closing(db_path=db_path) as exit_conn:
+        with write_txn(exit_conn):
+            row = exit_conn.execute(
+                "SELECT claim_lock FROM tasks WHERE id=? AND status='running' "
+                "AND current_run_id IS ? AND worker_pid=?",
+                (task_id, run_id, int(pid)),
+            ).fetchone()
+            if row is None:
+                return False
+            outcome, error, event_kind, payload, protocol_violation, rate_limited = (
+                _worker_exit_record(
+                    kind, code, pid=int(pid), claimer=row["claim_lock"], tail=tail,
+                )
+            )
+            cur = exit_conn.execute(
+                "UPDATE tasks SET status='ready', claim_lock=NULL, "
+                "claim_expires=NULL, worker_pid=NULL WHERE id=? "
+                "AND status='running' AND current_run_id IS ? AND worker_pid=?",
+                (task_id, run_id, int(pid)),
+            )
+            if cur.rowcount != 1:
+                return False
+            ended_run = _end_run(
+                exit_conn, task_id, outcome=outcome, status=outcome,
+                error=error[:500],
+                metadata=payload,
+            )
+            _append_event(
+                exit_conn, task_id, event_kind, payload,
+                run_id=ended_run,
+            )
+            exit_conn.execute(
+                "UPDATE tasks SET last_failure_error=? WHERE id=?",
+                (error[:500], task_id),
+            )
+        if protocol_violation:
+            streak = _protocol_violation_streak(exit_conn, task_id)
+            task = get_task(exit_conn, task_id)
+            limit = (
+                int(task.max_retries)
+                if task is not None and task.max_retries is not None
+                else _PROTOCOL_VIOLATION_FAILURE_LIMIT
+            )
+            if streak >= limit:
+                _record_task_failure(
+                    exit_conn, task_id, error, outcome="crashed",
+                    failure_limit=limit, force_trip=True,
+                    release_claim=False, end_run=False,
+                    event_payload_extra={
+                        "pid": int(pid), "protocol_violations": streak,
+                        "protocol_violation_limit": limit,
+                    },
+                )
+        elif not rate_limited:
+            _record_task_failure(
+                exit_conn, task_id, error,
+                outcome="crashed", release_claim=False, end_run=False,
+            )
+    return True
+
+
+def _watch_worker_exit(
+    proc: Any,
+    task_id: str,
+    run_id: Optional[int],
+    log_path: Path,
+    db_path: Path,
+    snapshot_lease: Optional[Any] = None,
+) -> None:
+    """Wait off-thread and promptly classify one detached worker exit.
+
+    The child can exit between ``Popen`` and the dispatcher's subsequent
+    ``_set_worker_pid`` transaction. Retry the CAS briefly so that race is
+    classified here instead of falling through to the next 60-second tick.
+    """
+    try:
+        returncode = int(proc.wait())
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if record_worker_exit(
+                task_id, run_id, int(proc.pid), returncode,
+                log_path=log_path, db_path=db_path,
+            ):
+                return
+            time.sleep(0.02)
+    except Exception:
+        _log.debug("kanban worker exit watcher failed", exc_info=True)
+    finally:
+        if snapshot_lease is not None:
+            from hermes_cli.kanban_runtime_snapshot import release_snapshot_lease
+
+            release_snapshot_lease(snapshot_lease)
+
+
 def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     """Record the spawned child's pid + emit a ``spawned`` event.
 
@@ -8182,6 +9531,481 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
                 (int(pid), run_id),
             )
         _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+
+
+class ReviewerAuthorityError(RuntimeError):
+    """A typed reviewer bootstrap failed closed before activation."""
+
+
+class ReviewerActivationStartFailed(ReviewerAuthorityError):
+    """PID was committed, but the child never completed READY+EOF."""
+
+
+_REVIEWER_ROLES = frozenset({"planner", "architect", "critic", "verifier"})
+_REVIEWER_HANDSHAKE_TIMEOUT = 10.0
+_REVIEWER_TERMINATE_GRACE = 2.0
+
+
+class HandshakeOwner:
+    """Single owner for a reviewer process until READY+EOF handoff."""
+
+    _TRANSITIONS = {
+        "CREATED": "CHILD_STARTED",
+        "CHILD_STARTED": "HELLO_ACCEPTED",
+        "HELLO_ACCEPTED": "PID_COMMITTED",
+        "PID_COMMITTED": "GRANT_SENT",
+        "GRANT_SENT": "READY",
+        "READY": "HANDED_OFF",
+    }
+
+    def __init__(self, proc: Any, descriptors: Sequence[int]):
+        self.proc = proc
+        self.descriptors = list(descriptors)
+        self.state = "CREATED"
+        self._closed = False
+
+    def advance(self, expected: str) -> None:
+        if self._TRANSITIONS.get(self.state) != expected:
+            raise ReviewerAuthorityError("bootstrap_protocol_violation")
+        self.state = expected
+
+    def close_descriptors(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for descriptor in self.descriptors:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+    def abort_and_reap(self) -> None:
+        if self.state == "HANDED_OFF":
+            return
+        self.state = "ABORTING"
+        self.close_descriptors()
+        if self.proc.poll() is not None:
+            try:
+                self.proc.wait(timeout=2)
+            except Exception:
+                pass
+            self.state = "REAPED"
+            return
+        terminate = (
+            self.proc.terminate
+            if _IS_WINDOWS
+            else lambda: os.killpg(self.proc.pid, signal.SIGTERM)
+        )
+        kill = (
+            self.proc.kill
+            if _IS_WINDOWS
+            else lambda: os.killpg(self.proc.pid, signal.SIGKILL)
+        )
+        try:
+            terminate()
+        except (OSError, ProcessLookupError):
+            pass
+        grace_deadline = time.monotonic() + _REVIEWER_TERMINATE_GRACE
+        while self.proc.poll() is None and time.monotonic() < grace_deadline:
+            time.sleep(0.01)
+        if self.proc.poll() is None:
+            try:
+                kill()
+            except (OSError, ProcessLookupError):
+                pass
+        try:
+            self.proc.wait(timeout=2)
+        except Exception:
+            pass
+        self.state = "REAPED"
+
+
+def _activation_start_failed(
+    conn: sqlite3.Connection, task: Task, pid: int, error: str,
+) -> None:
+    """Terminally close a PID-committed bootstrap without making it reusable."""
+    if task.current_run_id is None:
+        raise ReviewerAuthorityError("activation_start_failed_without_run")
+    run_id = int(task.current_run_id)
+    clean = str(error)[:500]
+    now = int(time.time())
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status='blocked', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, last_failure_error=? "
+            "WHERE id=? AND current_run_id=? AND worker_pid=?",
+            (clean, task.id, run_id, int(pid)),
+        )
+        conn.execute(
+            "UPDATE task_runs SET status='activation_start_failed', "
+            "outcome='activation_start_failed', error=?, ended_at=?, "
+            "claim_lock=NULL, claim_expires=NULL "
+            "WHERE id=? AND task_id=? AND worker_pid=? AND ended_at IS NULL",
+            (clean, now, run_id, task.id, int(pid)),
+        )
+        _append_event(
+            conn, task.id, "activation_start_failed",
+            {"pid": int(pid), "error": clean}, run_id=run_id,
+        )
+
+
+def _commit_reviewer_authority(
+    conn: sqlite3.Connection,
+    task: Task,
+    pid: int,
+    *,
+    parent_pid: int,
+) -> dict[str, Any]:
+    """Atomically bind a typed reviewer run to ``pid`` on ``conn``.
+
+    The caller owns the authoritative connection selected before claim.  This
+    function deliberately never resolves or reopens a database path.
+    """
+    role = (task.current_step_key or "").strip().lower()
+    if not _is_jerome_workflow_task(task) or role not in _REVIEWER_ROLES:
+        raise ReviewerAuthorityError("reviewer_authority_not_applicable")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        raise ReviewerAuthorityError("worker_pid_cas_failed")
+    if not isinstance(parent_pid, int) or isinstance(parent_pid, bool) or parent_pid <= 0:
+        raise ReviewerAuthorityError("grant_binding_mismatch")
+    if task.current_run_id is None or not task.claim_lock or task.claim_expires is None:
+        raise ReviewerAuthorityError("worker_pid_cas_failed")
+
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """
+            SELECT t.id, t.status, t.assignee, t.claim_lock, t.claim_expires,
+                   t.current_run_id, t.worker_pid, t.workflow_template_id,
+                   t.current_step_key, r.profile, r.status AS run_status,
+                   r.claim_lock AS run_claim_lock, r.claim_expires AS run_claim_expires,
+                   r.worker_pid AS run_worker_pid, r.ended_at
+              FROM tasks t JOIN task_runs r ON r.id=t.current_run_id
+             WHERE t.id=? AND t.current_run_id=? AND r.task_id=t.id
+            """,
+            (task.id, int(task.current_run_id)),
+        ).fetchone()
+        if row is None or any(
+            (
+                row["status"] != "running",
+                row["run_status"] != "running",
+                row["ended_at"] is not None,
+                row["assignee"] != task.assignee,
+                row["profile"] != task.assignee,
+                row["claim_lock"] != task.claim_lock,
+                row["run_claim_lock"] != task.claim_lock,
+                row["claim_expires"] != task.claim_expires,
+                row["run_claim_expires"] != task.claim_expires,
+                row["workflow_template_id"] != _JEROME_WORKFLOW_TEMPLATE,
+                (row["current_step_key"] or "").strip().lower() != role,
+                row["worker_pid"] is not None,
+                row["run_worker_pid"] is not None,
+            )
+        ):
+            raise ReviewerAuthorityError("worker_pid_cas_failed")
+        task_update = conn.execute(
+            """
+            UPDATE tasks SET worker_pid=?
+             WHERE id=? AND status='running' AND current_run_id=?
+               AND claim_lock=? AND claim_expires=? AND worker_pid IS NULL
+               AND workflow_template_id=? AND current_step_key=?
+            """,
+            (
+                pid, task.id, int(task.current_run_id), task.claim_lock,
+                int(task.claim_expires), _JEROME_WORKFLOW_TEMPLATE, role,
+            ),
+        )
+        run_update = conn.execute(
+            """
+            UPDATE task_runs SET worker_pid=?
+             WHERE id=? AND task_id=? AND status='running' AND ended_at IS NULL
+               AND claim_lock=? AND claim_expires=? AND worker_pid IS NULL
+               AND profile=?
+            """,
+            (
+                pid, int(task.current_run_id), task.id, task.claim_lock,
+                int(task.claim_expires), task.assignee,
+            ),
+        )
+        if task_update.rowcount != 1 or run_update.rowcount != 1:
+            raise ReviewerAuthorityError("worker_pid_cas_failed")
+        grant = {
+            "v": 1,
+            "task_id": task.id,
+            "run_id": int(task.current_run_id),
+            "claim_lock": task.claim_lock,
+            "role": role,
+            "profile": task.assignee,
+            "workflow": _JEROME_WORKFLOW_TEMPLATE,
+            "pid": pid,
+            "parent_pid": parent_pid,
+            "expires_at": int(task.claim_expires),
+            "grant_id": secrets.token_hex(32),
+        }
+        _append_event(conn, task.id, "spawned", {"pid": pid}, run_id=task.current_run_id)
+        conn.commit()
+        return grant
+    except ReviewerAuthorityError:
+        conn.rollback()
+        raise
+    except Exception as exc:
+        conn.rollback()
+        raise ReviewerAuthorityError("sqlite_authority_commit_failed") from exc
+
+
+def _commit_generic_worker_binding(
+    conn: sqlite3.Connection,
+    task: Task,
+    pid: int,
+    *,
+    parent_pid: int,
+) -> dict[str, Any]:
+    """Atomically bind a generic run before allowing user code to execute."""
+    if task.current_run_id is None or not task.claim_lock or task.claim_expires is None:
+        raise ReviewerAuthorityError("worker_pid_cas_failed")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        task_update = conn.execute(
+            """UPDATE tasks SET worker_pid=?
+                 WHERE id=? AND status='running' AND current_run_id=?
+                   AND claim_lock=? AND claim_expires=? AND worker_pid IS NULL""",
+            (pid, task.id, int(task.current_run_id), task.claim_lock, int(task.claim_expires)),
+        )
+        run_update = conn.execute(
+            """UPDATE task_runs SET worker_pid=?
+                 WHERE id=? AND task_id=? AND status='running' AND ended_at IS NULL
+                   AND claim_lock=? AND claim_expires=? AND worker_pid IS NULL
+                   AND profile=?""",
+            (pid, int(task.current_run_id), task.id, task.claim_lock,
+             int(task.claim_expires), task.assignee),
+        )
+        if task_update.rowcount != 1 or run_update.rowcount != 1:
+            raise ReviewerAuthorityError("worker_pid_cas_failed")
+        grant = {
+            "v": 1, "task_id": task.id, "run_id": int(task.current_run_id),
+            "claim_lock": task.claim_lock, "role": "worker",
+            "profile": task.assignee, "workflow": "generic", "pid": pid,
+            "parent_pid": parent_pid, "expires_at": int(task.claim_expires),
+            "grant_id": secrets.token_hex(32),
+        }
+        _append_event(conn, task.id, "spawned", {"pid": pid}, run_id=task.current_run_id)
+        conn.commit()
+        return grant
+    except ReviewerAuthorityError:
+        conn.rollback()
+        raise
+    except Exception as exc:
+        conn.rollback()
+        raise ReviewerAuthorityError("sqlite_authority_commit_failed") from exc
+
+
+def _posix_pipe() -> tuple[int, int]:
+    if hasattr(os, "pipe2"):
+        return os.pipe2(os.O_CLOEXEC)
+    pair = os.pipe()
+    try:
+        for descriptor in pair:
+            os.set_inheritable(descriptor, False)
+    except BaseException:
+        for descriptor in pair:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise
+    return pair
+
+
+def _spawn_posix_reviewer(
+    conn: sqlite3.Connection,
+    task: Task,
+    cmd: Sequence[str],
+    *,
+    cwd: Optional[str],
+    env: Mapping[str, str],
+    stdout: Any,
+    runtime: Optional[WorkerRuntimeSpec] = None,
+    generic: bool = False,
+) -> Any:
+    """Run HELLO→commit→GRANT→READY+EOF and return a handed-off process."""
+    if _IS_WINDOWS:
+        raise ReviewerAuthorityError(
+            "UNVERIFIED_PENDING_WINDOWS_CI: secure_job_unavailable"
+        )
+    from tools.reviewer_authority import (
+        BootstrapHandshakeTimeoutError,
+        read_bootstrap_frame,
+        require_bootstrap_eof,
+        write_bootstrap_frame,
+    )
+
+    bootstrap = Path(__file__).with_name("reviewer_bootstrap.py")
+    child_env = dict(env)
+    try:
+        cli_start = list(cmd).index("-p")
+    except ValueError as exc:
+        raise ReviewerAuthorityError("bootstrap_protocol_violation") from exc
+    launch_argv = list(cmd)[cli_start:]
+    review_role = (task.current_step_key or "").strip().lower()
+    if not generic and (
+        len(launch_argv) < 3
+        or launch_argv[0] != "-p"
+        or launch_argv[1] != review_role
+        or review_role not in _REVIEWER_ROLES
+    ):
+        raise ReviewerAuthorityError("bootstrap_protocol_violation")
+    child_env["HERMES_KANBAN_REVIEW_LAUNCH_ARGV"] = json.dumps(launch_argv)
+    child_env["HERMES_KANBAN_REVIEW_PYTHONPATH"] = str(bootstrap.parents[1])
+    child_env["HERMES_KANBAN_BOOTSTRAP_MODE"] = "generic" if generic else "reviewer"
+    child_env.pop("HERMES_KANBAN_REVIEW_ROLE", None)
+    all_descriptors: list[int] = []
+    bundle_fd: Optional[int] = None
+    bundle_handle: Optional[Any] = None
+    try:
+        c2p_r, c2p_w = _posix_pipe()
+        all_descriptors.extend((c2p_r, c2p_w))
+        p2c_r, p2c_w = _posix_pipe()
+        all_descriptors.extend((p2c_r, p2c_w))
+        bootstrap_cmd = [sys.executable, "-I", str(bootstrap), str(c2p_w), str(p2c_r)]
+        if runtime is not None and runtime.snapshot is not None:
+            from hermes_cli.kanban_runtime_snapshot import (
+                manifest_resource_bytes,
+                verified_snapshot_bundle,
+            )
+
+            bootstrap_bytes = manifest_resource_bytes(
+                runtime.snapshot, "hermes_cli/reviewer_bootstrap.py"
+            )
+            bundle = verified_snapshot_bundle(runtime.snapshot)
+            bundle_handle = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
+            json.dump(bundle, bundle_handle, sort_keys=True, separators=(",", ":"))
+            bundle_handle.flush()
+            bundle_handle.seek(0)
+            bundle_fd = int(bundle_handle.fileno())
+            all_descriptors.append(bundle_fd)
+            child_env["HERMES_KANBAN_VERIFIED_SNAPSHOT_FD"] = str(bundle_fd)
+            bootstrap_cmd = [
+                sys.executable, "-I", "-c",
+                "import sys;_b=bytes.fromhex(sys.argv.pop(1));exec(compile(_b,'hermes_cli/reviewer_bootstrap.py','exec'))",
+                bootstrap_bytes.hex(), str(c2p_w), str(p2c_r),
+                str(runtime.snapshot.object_root),
+                runtime.snapshot.manifest_sha256,
+                runtime.snapshot.cache_key,
+            ]
+        proc = subprocess.Popen(
+            bootstrap_cmd,
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout,
+            stderr=subprocess.STDOUT,
+            env=child_env,
+            close_fds=True,
+            pass_fds=tuple(dict.fromkeys((
+                c2p_w,
+                p2c_r,
+                *((bundle_fd,) if bundle_fd is not None else ()),
+                *((runtime.pass_fds) if runtime is not None else ()),
+            ))),
+            start_new_session=True,
+        )
+    except BaseException:
+        for descriptor in all_descriptors:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise
+    owner = HandshakeOwner(proc, (c2p_r, c2p_w, p2c_r, p2c_w))
+    deadline = time.monotonic() + _REVIEWER_HANDSHAKE_TIMEOUT
+    owner.advance("CHILD_STARTED")
+    os.close(c2p_w)
+    os.close(p2c_r)
+    owner.descriptors = [c2p_r, p2c_w]
+    try:
+        with os.fdopen(c2p_r, "rb", buffering=0) as child_stream, os.fdopen(
+            p2c_w, "wb", buffering=0
+        ) as parent_stream:
+            owner.descriptors = []
+            hello = read_bootstrap_frame(
+                child_stream,
+                max_bytes=1024,
+                fields={"challenge": str, "pid": int, "ppid": int, "v": int},
+                deadline=deadline,
+            )
+            if hello != {
+                "challenge": hello["challenge"],
+                "pid": proc.pid,
+                "ppid": os.getpid(),
+                "v": 1,
+            }:
+                raise ReviewerAuthorityError("grant_binding_mismatch")
+            owner.advance("HELLO_ACCEPTED")
+            grant = (
+                _commit_generic_worker_binding(conn, task, proc.pid, parent_pid=os.getpid())
+                if generic
+                else _commit_reviewer_authority(conn, task, proc.pid, parent_pid=os.getpid())
+            )
+            grant["challenge"] = hello["challenge"]
+            owner.advance("PID_COMMITTED")
+            write_bootstrap_frame(parent_stream, grant, max_bytes=4096, deadline=deadline)
+            owner.advance("GRANT_SENT")
+            ready = read_bootstrap_frame(
+                child_stream,
+                max_bytes=1024,
+                fields={"grant_id": str, "pid": int, "v": int},
+                deadline=deadline,
+            )
+            if ready != {"grant_id": grant["grant_id"], "pid": proc.pid, "v": 1}:
+                raise ReviewerAuthorityError("grant_binding_mismatch")
+            owner.advance("READY")
+            require_bootstrap_eof(child_stream, deadline=deadline)
+            if runtime is not None and runtime.lease is not None:
+                from hermes_cli.kanban_runtime_snapshot import (
+                    bind_snapshot_lease,
+                    mark_snapshot_lease_ready,
+                )
+
+                runtime = WorkerRuntimeSpec(
+                    argv=runtime.argv,
+                    env=runtime.env,
+                    snapshot=runtime.snapshot,
+                    lease=bind_snapshot_lease(
+                        mark_snapshot_lease_ready(runtime.lease, pid=proc.pid),
+                        pid=proc.pid,
+                    ),
+                    pass_fds=runtime.pass_fds,
+                )
+            # EOF on the grant/release pipe is the execution capability. Keep
+            # it withheld until READY+child EOF and durable lease binding have
+            # both succeeded, so generic payload code cannot race the bind.
+            parent_stream.close()
+        owner.advance("HANDED_OFF")
+        return proc
+    except Exception as exc:
+        pid_committed = owner.state in {"PID_COMMITTED", "GRANT_SENT", "READY"}
+        owner.abort_and_reap()
+        if pid_committed:
+            _activation_start_failed(conn, task, proc.pid, str(exc))
+            raise ReviewerActivationStartFailed("activation_start_failed") from exc
+        if isinstance(exc, BootstrapHandshakeTimeoutError):
+            raise ReviewerAuthorityError("bootstrap_handshake_timeout") from exc
+        raise
+
+
+def _spawn_posix_generic_worker(
+    conn: sqlite3.Connection,
+    task: Task,
+    cmd: Sequence[str],
+    *,
+    cwd: Optional[str],
+    env: Mapping[str, str],
+    stdout: Any,
+    runtime: Optional[WorkerRuntimeSpec] = None,
+) -> Any:
+    return _spawn_posix_reviewer(
+        conn, task, cmd, cwd=cwd, env=env, stdout=stdout,
+        runtime=runtime, generic=True,
+    )
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -8396,6 +10220,69 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
         if profile_exists(row["assignee"]):
             return True
     return False
+
+
+def _dispatch_preflight_error(task: Task) -> Optional[str]:
+    """Validate deterministic worker startup prerequisites before claiming."""
+    if not task.assignee:
+        return "missing assignee"
+    from hermes_cli.profiles import profile_exists, resolve_profile_env
+    if not profile_exists(task.assignee):
+        return f"unknown profile '{task.assignee}'"
+    try:
+        profile_home = resolve_profile_env(task.assignee)
+    except (FileNotFoundError, ValueError) as exc:
+        return str(exc)
+
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    token = set_hermes_home_override(profile_home)
+    try:
+        from hermes_cli.plugins import discover_plugins
+
+        discover_plugins()
+        if task.skills:
+            from tools.skills_tool import skill_view
+            for skill in task.skills:
+                try:
+                    resolved = json.loads(skill_view(str(skill), preprocess=False))
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    return f"could not resolve skill '{skill}': {exc}"
+                if not resolved.get("success"):
+                    return f"unknown skill '{skill}' for profile '{task.assignee}'"
+        from hermes_cli.config import load_config
+        from toolsets import validate_toolset
+        cfg = load_config()
+        requested = ((cfg.get("platform_toolsets") or {}).get("cli") or [])
+        mcp_names = set((cfg.get("mcp_servers") or {}).keys())
+        for toolset in requested:
+            name = str(toolset)
+            if not validate_toolset(name) and name not in mcp_names:
+                return f"unknown toolset '{name}' for profile '{task.assignee}'"
+        effective = _resolve_worker_cli_toolsets(profile_home) or []
+        for toolset in effective:
+            if not validate_toolset(toolset) and toolset not in mcp_names:
+                return f"unavailable toolset '{toolset}' for profile '{task.assignee}'"
+    finally:
+        reset_hermes_home_override(token)
+    return None
+
+
+def _block_preflight_failure(
+    conn: sqlite3.Connection, task_id: str, error: str,
+) -> None:
+    """Atomically block an invalid card without creating/consuming a run."""
+    from agent.redact import redact_sensitive_text
+
+    clean = redact_sensitive_text(error, force=True)[:500]
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET status='blocked', last_failure_error=?, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL "
+            "WHERE id=? AND status IN ('ready', 'review') AND claim_lock IS NULL",
+            (clean, task_id),
+        )
+        if cur.rowcount == 1:
+            _append_event(conn, task_id, "preflight_failed", {"error": clean})
 
 
 def dispatch_once(
@@ -8672,13 +10559,9 @@ def _dispatch_once_locked(
         except Exception:
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row_assignee):
-            # Bucket separately from skipped_unassigned: the operator
-            # cannot fix this by assigning a profile (the assignee IS the
-            # intended owner — a terminal lane). Health telemetry uses
-            # this distinction to suppress spurious "stuck" warnings on
-            # multi-lane setups where the ready queue is steadily full
-            # of human-pulled work.
-            result.skipped_nonspawnable.append(row["id"])
+            _block_preflight_failure(
+                conn, row["id"], f"unknown profile '{row_assignee}'",
+            )
             continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
@@ -8725,6 +10608,13 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
+        task_for_preflight = get_task(conn, row["id"])
+        if task_for_preflight is None:
+            continue
+        preflight_error = _dispatch_preflight_error(task_for_preflight)
+        if preflight_error:
+            _block_preflight_failure(conn, row["id"], preflight_error)
+            continue
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
@@ -8742,6 +10632,18 @@ def _dispatch_once_locked(
             if auto:
                 result.auto_blocked.append(claimed.id)
             continue
+        role = (claimed.current_step_key or claimed.assignee or "").strip().lower()
+        if _is_jerome_workflow_task(claimed) and role in {"architect", "critic"}:
+            try:
+                bind_review_run_authority(conn, claimed.id, workspace)
+            except Exception as exc:
+                auto = _record_spawn_failure(
+                    conn, claimed.id, f"review_authority: {exc}",
+                    failure_limit=failure_limit,
+                )
+                if auto:
+                    result.auto_blocked.append(claimed.id)
+                continue
         # Persist the resolved workspace path so the worker can cd there.
         set_workspace_path(conn, claimed.id, str(workspace))
         if claimed.workspace_kind == "worktree":
@@ -8755,14 +10657,30 @@ def _dispatch_once_locked(
             import inspect
             try:
                 sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
+                if "authority_conn" in sig.parameters:
+                    pid = _spawn(
+                        claimed, str(workspace), board=board, authority_conn=conn,
+                    )
+                elif "board" in sig.parameters:
                     pid = _spawn(claimed, str(workspace), board=board)
                 else:
                     pid = _spawn(claimed, str(workspace))
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+            spawn_result = (
+                pid if isinstance(pid, SpawnedWorker)
+                else SpawnedWorker(pid=int(pid or 0))
+            )
+            if spawn_result.returncode is not None:
+                _set_worker_pid(conn, claimed.id, spawn_result.pid)
+                record_worker_exit(
+                    claimed.id, claimed.current_run_id, spawn_result.pid,
+                    spawn_result.returncode, log_path=spawn_result.log_path,
+                    db_path=kanban_db_path(board=board),
+                )
+                continue
+            if spawn_result.pid and not spawn_result.pid_committed:
+                _set_worker_pid(conn, claimed.id, spawn_result.pid)
             # NOTE: we intentionally do NOT reset consecutive_failures
             # here. A successful spawn proves the worker can start but
             # doesn't prove the run will succeed. Under unified
@@ -8779,6 +10697,8 @@ def _dispatch_once_locked(
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
+        except ReviewerActivationStartFailed:
+            continue
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
@@ -8807,15 +10727,18 @@ def _dispatch_once_locked(
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
-        try:
-            from hermes_cli.profiles import profile_exists
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row["assignee"]):
-            result.skipped_nonspawnable.append(row["id"])
-            continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
+            continue
+        task_for_preflight = get_task(conn, row["id"])
+        if task_for_preflight is None:
+            continue
+        task_for_preflight.skills = list(task_for_preflight.skills or [])
+        if "sdlc-review" not in task_for_preflight.skills:
+            task_for_preflight.skills.append("sdlc-review")
+        preflight_error = _dispatch_preflight_error(task_for_preflight)
+        if preflight_error:
+            _block_preflight_failure(conn, row["id"], preflight_error)
             continue
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
@@ -8834,6 +10757,18 @@ def _dispatch_once_locked(
             if auto:
                 result.auto_blocked.append(claimed.id)
             continue
+        role = (claimed.current_step_key or claimed.assignee or "").strip().lower()
+        if _is_jerome_workflow_task(claimed) and role in {"architect", "critic"}:
+            try:
+                bind_review_run_authority(conn, claimed.id, workspace)
+            except Exception as exc:
+                auto = _record_spawn_failure(
+                    conn, claimed.id, f"review_authority: {exc}",
+                    failure_limit=failure_limit,
+                )
+                if auto:
+                    result.auto_blocked.append(claimed.id)
+                continue
         # Persist the resolved workspace path so the worker can cd there.
         set_workspace_path(conn, claimed.id, str(workspace))
         if claimed.workspace_kind == "worktree":
@@ -8844,22 +10779,42 @@ def _dispatch_once_locked(
         # kanban lifecycle is already injected into every worker's system
         # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
         # review agent needs.
-        claimed.skills = ["sdlc-review"]
+        claimed.skills = list(claimed.skills or [])
+        if "sdlc-review" not in claimed.skills:
+            claimed.skills.append("sdlc-review")
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             import inspect
             try:
                 sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
+                if "authority_conn" in sig.parameters:
+                    pid = _spawn(
+                        claimed, str(workspace), board=board, authority_conn=conn,
+                    )
+                elif "board" in sig.parameters:
                     pid = _spawn(claimed, str(workspace), board=board)
                 else:
                     pid = _spawn(claimed, str(workspace))
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+            spawn_result = (
+                pid if isinstance(pid, SpawnedWorker)
+                else SpawnedWorker(pid=int(pid or 0))
+            )
+            if spawn_result.returncode is not None:
+                _set_worker_pid(conn, claimed.id, spawn_result.pid)
+                record_worker_exit(
+                    claimed.id, claimed.current_run_id, spawn_result.pid,
+                    spawn_result.returncode, log_path=spawn_result.log_path,
+                    db_path=kanban_db_path(board=board),
+                )
+                continue
+            if spawn_result.pid and not spawn_result.pid_committed:
+                _set_worker_pid(conn, claimed.id, spawn_result.pid)
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
+        except ReviewerActivationStartFailed:
+            continue
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
@@ -9068,6 +11023,193 @@ def _resolve_hermes_argv() -> list[str]:
     return _module_hermes_argv()
 
 
+def _git_revision(path: Path | str) -> Optional[str]:
+    """Return the immutable Git revision containing ``path``, if available."""
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "HEAD"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    revision = completed.stdout.strip()
+    return revision if completed.returncode == 0 and _HEX_REVISION_RE.fullmatch(revision) else None
+
+
+def _git_output(path: Path | str, *args: str) -> Optional[str]:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(path), *args],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, check=False, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    value = completed.stdout.strip()
+    return value if completed.returncode == 0 and value else None
+
+
+def _git_checkout_identity(path: Path | str) -> Optional[dict[str, str]]:
+    """Return a worktree-stable, repository-specific Git identity."""
+    root_raw = _git_output(path, "rev-parse", "--show-toplevel")
+    common_raw = _git_output(
+        path, "rev-parse", "--path-format=absolute", "--git-common-dir",
+    )
+    revision = _git_revision(path)
+    roots_raw = _git_output(path, "rev-list", "--max-parents=0", "HEAD")
+    if not root_raw or not common_raw or not revision or not roots_raw:
+        return None
+    root = Path(root_raw).resolve(strict=True)
+    common = Path(common_raw).resolve(strict=True)
+    repository_id = hashlib.sha256(
+        (str(common) + "\0" + "\n".join(sorted(roots_raw.splitlines()))).encode()
+    ).hexdigest()
+    return {
+        "root": str(root),
+        "git_common_dir": str(common),
+        "repository_id": repository_id,
+        "revision": revision,
+    }
+
+
+def _dispatcher_runtime_identity() -> Optional[dict[str, str]]:
+    return _git_checkout_identity(Path(__file__).resolve().parents[1])
+
+
+def _trusted_runtime_source_root(workspace: Path | str) -> Optional[tuple[Path, dict[str, str]]]:
+    """Return an exact same-repository root; generic workspaces remain unchanged."""
+    candidate = Path(workspace).expanduser()
+    try:
+        if candidate.absolute() != candidate.resolve(strict=True):
+            return None
+    except OSError:
+        return None
+    if not (candidate / ".git").exists():
+        return None
+    workspace_identity = _git_checkout_identity(candidate)
+    dispatcher_identity = _dispatcher_runtime_identity()
+    if not workspace_identity or not dispatcher_identity:
+        return None
+    if (
+        workspace_identity["git_common_dir"] != dispatcher_identity["git_common_dir"]
+        or workspace_identity["repository_id"] != dispatcher_identity["repository_id"]
+    ):
+        return None
+    root = Path(workspace_identity["root"])
+    if candidate.resolve(strict=True) != root:
+        return None
+    return root, workspace_identity
+
+
+def _runtime_snapshot_cache_root() -> Path:
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "kanban" / "runtime-snapshots" / "v1"
+
+
+def _worker_runtime_spec(task: Task, workspace: Path | str) -> WorkerRuntimeSpec:
+    """Build a sealed snapshot for same-repository workers, else use installed Hermes."""
+    selected = _trusted_runtime_source_root(workspace)
+    if selected is None:
+        return WorkerRuntimeSpec(argv=_resolve_hermes_argv())
+    root, identity = selected
+    from hermes_cli.kanban_runtime_snapshot import (
+        build_runtime_snapshot,
+        dispatcher_runtime_bindings,
+        prepare_snapshot_lease,
+        runtime_binding_pass_fds,
+        runtime_bindings_json,
+        with_runtime_bindings,
+    )
+
+    snapshot = build_runtime_snapshot(
+        root,
+        repository_id=identity["repository_id"],
+        source_revision=identity["revision"],
+        source_dirty=bool(_git_output(root, "status", "--porcelain", "--untracked-files=all")),
+        cache_root=_runtime_snapshot_cache_root(),
+    )
+    snapshot = with_runtime_bindings(snapshot, dispatcher_runtime_bindings())
+    if task.current_run_id is None:
+        from hermes_cli.kanban_runtime_snapshot import RuntimeSnapshotError
+
+        raise RuntimeSnapshotError("snapshot_lease_missing_run")
+    lease = prepare_snapshot_lease(
+        snapshot,
+        cache_root=_runtime_snapshot_cache_root(),
+        task_id=task.id,
+        run_id=int(task.current_run_id),
+    )
+    return WorkerRuntimeSpec(
+        argv=[
+            sys.executable, "-I", "-S", "-c", _IMMUTABLE_RUNTIME_LAUNCHER,
+            str(snapshot.object_root), snapshot.manifest_sha256, snapshot.cache_key,
+            runtime_bindings_json(snapshot),
+        ],
+        env={"HERMES_KANBAN_RUNTIME_REVISION": snapshot.source_revision},
+        snapshot=snapshot,
+        lease=lease,
+        pass_fds=runtime_binding_pass_fds(snapshot.runtime_bindings),
+    )
+
+
+def _verify_worker_runtime_provenance(*, capability=None) -> Optional[dict[str, Any]]:
+    """Derive provenance solely from the bootstrap-installed capability."""
+    from hermes_cli.kanban_runtime_snapshot import snapshot_bootstrap_capability
+
+    installed = snapshot_bootstrap_capability()
+    if installed is None:
+        return None
+    if capability is not None and capability is not installed:
+        raise WorkerRuntimeMismatch("pinned runtime bootstrap capability mismatch")
+    spec = installed.spec
+    return {
+        "revision": spec.source_revision,
+        "dirty": spec.source_dirty,
+        "snapshot_cache_key": spec.cache_key,
+        "manifest_sha256": spec.manifest_sha256,
+        "content_root_sha256": spec.content_root_sha256,
+        "runtime_root": str(spec.payload_root),
+        "guard_version": installed.guard_version,
+    }
+
+
+def record_worker_runtime_provenance(*, capability=None) -> Optional[dict[str, Any]]:
+    """Durably attach sealed runtime provenance for the active worker run."""
+    receipt = _verify_worker_runtime_provenance(capability=capability)
+    if receipt is None:
+        return None
+    task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    run_id_raw = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()
+    if not task_id or not run_id_raw:
+        raise WorkerRuntimeMismatch("pinned runtime is missing task/run identity")
+    try:
+        run_id = int(run_id_raw)
+    except ValueError as exc:
+        raise WorkerRuntimeMismatch("pinned runtime has invalid run identity") from exc
+    with connect_closing() as conn:
+        with write_txn(conn):
+            row = conn.execute(
+                "SELECT metadata FROM task_runs WHERE id=? AND task_id=? AND status='running'",
+                (run_id, task_id),
+            ).fetchone()
+            if row is None:
+                raise WorkerRuntimeMismatch("pinned runtime run is not active")
+            metadata = json.loads(row["metadata"]) if row["metadata"] else {}
+            metadata["runtime_provenance"] = receipt
+            conn.execute(
+                "UPDATE task_runs SET metadata=? WHERE id=?",
+                (json.dumps(metadata, ensure_ascii=False), run_id),
+            )
+            _append_event(conn, task_id, "runtime_provenance", receipt, run_id=run_id)
+    return receipt
+
+
 def _worker_terminal_timeout_env(
     max_runtime_seconds: Optional[int],
     current_timeout: Optional[str],
@@ -9098,7 +11240,11 @@ def _worker_terminal_timeout_env(
     return str(desired)
 
 
-def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[str]]:
+def _resolve_worker_cli_toolsets(
+    hermes_home: Optional[str],
+    *,
+    task: Optional[Task] = None,
+) -> Optional[list[str]]:
     """Return the assigned profile's effective CLI toolsets for a worker.
 
     Dispatcher-spawned workers are launched from a long-lived gateway process,
@@ -9129,6 +11275,17 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
                 toolsets = [ts for ts in toolsets if ts != "kanban"]
                 if "kanban-worker-lifecycle" not in toolsets:
                     toolsets.append("kanban-worker-lifecycle")
+            role = (
+                (task.current_step_key or "").strip().lower()
+                if task is not None and _is_jerome_workflow_task(task)
+                else ""
+            )
+            if role in {"planner", "architect", "critic", "verifier"}:
+                # Do not preserve unknown/profile plugin toolsets: a custom
+                # composite can re-export a mutation tool under any name.
+                toolsets = [
+                    "review-readonly", "kanban-worker-lifecycle", "review-exec",
+                ]
         finally:
             reset_hermes_home_override(token)
         return toolsets or None
@@ -9172,7 +11329,8 @@ def _default_spawn(
     workspace: str,
     *,
     board: Optional[str] = None,
-) -> Optional[int]:
+    authority_conn: Optional[sqlite3.Connection] = None,
+) -> Optional[int | SpawnedWorker]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
     Returns the spawned child's PID so the dispatcher can detect crashes
@@ -9224,6 +11382,17 @@ def _default_spawn(
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_WORKSPACE"] = workspace
+    review_role = (
+        (task.current_step_key or "").strip().lower()
+        if _is_jerome_workflow_task(task)
+        else ""
+    )
+    # Reviewer authority is transferred only by the two-pipe bootstrap. An
+    # inherited role marker is attacker-spoofable and must never activate or
+    # identify a typed reviewer process.
+    env.pop("HERMES_KANBAN_REVIEW_ROLE", None)
+    if review_role in _REVIEWER_ROLES and authority_conn is None:
+        raise ReviewerAuthorityError("reviewer_authority_unavailable")
     # Tag the worker's session so it lands in state.db as `kanban`, not as an
     # untitled `cli` row. A worker is a dispatcher-owned run whose transcript is
     # read on the board and in `hermes kanban log` — it is not a conversation
@@ -9299,8 +11468,10 @@ def _default_spawn(
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
 
+    runtime = _worker_runtime_spec(task, workspace)
+    env.update(runtime.env)
     cmd = [
-        *_resolve_hermes_argv(),
+        *runtime.argv,
         "-p", profile_arg,
         "--cli",
         # Worker subprocesses switch to a profile-scoped HERMES_HOME above,
@@ -9331,7 +11502,7 @@ def _default_spawn(
     # branch, not a nested one.
     if task.reasoning_effort:
         cmd.extend(["--reasoning", task.reasoning_effort])
-    worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+    worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"), task=task)
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend([
@@ -9355,30 +11526,66 @@ def _default_spawn(
     rotate_bytes, backup_count = worker_log_rotation_config()
     _rotate_worker_log(log_path, rotate_bytes, backup_count)
 
+    # Typed reviewers fail closed until the secure Job Object adapter has live
+    # Windows CI proof. Generic workers retain the established Windows Popen
+    # path; reviewer authority is the security boundary being tightened here.
+    if _IS_WINDOWS and review_role in _REVIEWER_ROLES:
+        raise ReviewerAuthorityError("UNVERIFIED_PENDING_WINDOWS_CI: secure_job_unavailable")
+
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")
     try:
-        proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
-            cmd,
-            cwd=workspace if os.path.isdir(workspace) else None,
-            stdin=subprocess.DEVNULL,
-            stdout=log_f,
-            stderr=subprocess.STDOUT,
-            env=env,
-            start_new_session=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
-        )
+        if _IS_WINDOWS:
+            proc = subprocess.Popen(  # noqa: S603 -- fixed argv assembled above
+                cmd,
+                cwd=workspace if os.path.isdir(workspace) else None,
+                stdin=subprocess.DEVNULL,
+                stdout=log_f,
+                stderr=subprocess.STDOUT,
+                env=env,
+                start_new_session=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        elif review_role in _REVIEWER_ROLES and authority_conn is not None:
+            proc = _spawn_posix_reviewer(
+                authority_conn, task, cmd,
+                cwd=workspace if os.path.isdir(workspace) else None,
+                env=env, stdout=log_f, runtime=runtime,
+            )
+        else:
+            if authority_conn is None:
+                raise ReviewerAuthorityError("worker_binding_authority_unavailable")
+            proc = _spawn_posix_generic_worker(
+                authority_conn, task, cmd,
+                cwd=workspace if os.path.isdir(workspace) else None,
+                env=env, stdout=log_f, runtime=runtime,
+            )
     except FileNotFoundError:
         log_f.close()
         raise RuntimeError(
             "`hermes` executable not found on PATH. "
             "Install Hermes Agent or activate its venv before running the kanban dispatcher."
         )
+    watcher = threading.Thread(
+        target=_watch_worker_exit,
+        args=(
+            proc, task.id, task.current_run_id, log_path, kanban_db_path(board=board),
+            runtime.lease,
+        ),
+        name=f"kanban-exit-{task.id}",
+        daemon=True,
+    )
+    watcher.start()
     # NOTE: we intentionally do NOT close log_f here — we want Popen's
     # child process to keep writing after this function returns.  The
     # handle is kept alive by the child's inheritance.  The parent's
     # reference goes out of scope and is GC'd, but the OS-level FD stays
     # open in the child until the child exits.
+    if (
+        (review_role in _REVIEWER_ROLES and authority_conn is not None)
+        or runtime.lease is not None
+    ):
+        return SpawnedWorker(pid=proc.pid, pid_committed=True)
     return proc.pid
 
 
