@@ -112,6 +112,10 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
         scope_id = getattr(source, "scope_id", None)
         if scope_id:
             metadata["slack_team_id"] = str(scope_id)
+    elif _platform_name(getattr(source, "platform", None)) == "discord":
+        scope_id = getattr(source, "scope_id", None) or getattr(source, "guild_id", None)
+        if scope_id:
+            metadata["discord_guild_id"] = str(scope_id)
     if not metadata:
         return None
     if _platform_name(getattr(source, "platform", None)) == "telegram" and getattr(source, "chat_type", None) == "dm":
@@ -2488,6 +2492,87 @@ class SendResult:
     # ``None`` (unset / not classified).  Producers should set this via
     # :func:`classify_send_error`.
     error_kind: Optional[str] = None
+    # Side-effect certainty is distinct from retryability. Structured sends
+    # only retry when an adapter proves no platform request was made.
+    delivery_certainty: Optional[str] = None
+    structured_failure: Optional[str] = None
+
+
+class _GatewayDeliveryResponse(str):
+    """Private string-compatible carrier for validated final-delivery metadata."""
+
+    delivery_metadata: dict
+
+    def __new__(cls, text: str, *, delivery_metadata: Any = None):
+        value = super().__new__(cls, text)
+        value.delivery_metadata = _freeze_gateway_delivery_metadata(delivery_metadata)
+        return value
+
+
+def _freeze_gateway_delivery_metadata(metadata: Any) -> dict:
+    """Accept only immutable, validated Discord details envelopes."""
+    if not isinstance(metadata, dict) or set(metadata) != {"discord_product_details"}:
+        return {}
+    from gateway.discord_product_details import (
+        DiscordProductDetailsEnvelopeV1,
+        validate_discord_product_details,
+    )
+
+    envelope = metadata.get("discord_product_details")
+    if not isinstance(envelope, DiscordProductDetailsEnvelopeV1):
+        return {}
+    try:
+        envelope = validate_discord_product_details(envelope)
+    except (TypeError, ValueError):
+        return {}
+    return {"discord_product_details": envelope}
+
+
+def _unwrap_gateway_delivery_response(value: Any) -> tuple[Any, Optional[dict]]:
+    if not isinstance(value, _GatewayDeliveryResponse):
+        return value, None
+    from gateway.discord_product_details import discord_product_details_to_canonical_mapping
+
+    frozen = getattr(value, "delivery_metadata", {})
+    envelope = frozen.get("discord_product_details")
+    metadata = (
+        {"discord_product_details": discord_product_details_to_canonical_mapping(envelope)}
+        if envelope is not None
+        else None
+    )
+    return str(value), metadata
+
+
+def _merge_gateway_delivery_metadata(routing_metadata: Any, delivery_metadata: Any) -> dict:
+    """Merge the sole structured allowlist key without overriding routing."""
+    merged = dict(routing_metadata) if isinstance(routing_metadata, dict) else {}
+    if not isinstance(delivery_metadata, dict) or set(delivery_metadata) != {"discord_product_details"}:
+        return merged
+    from gateway.discord_product_details import (
+        discord_product_details_to_canonical_mapping,
+        validate_discord_product_details,
+    )
+
+    try:
+        incoming = discord_product_details_to_canonical_mapping(
+            validate_discord_product_details(delivery_metadata["discord_product_details"])
+        )
+    except (TypeError, ValueError):
+        return merged
+    current = merged.get("discord_product_details")
+    if current is not None:
+        try:
+            current = discord_product_details_to_canonical_mapping(
+                validate_discord_product_details(current)
+            )
+        except (TypeError, ValueError):
+            current = None
+        if current != incoming:
+            merged.pop("discord_product_details", None)
+            logger.warning("gateway_delivery_metadata_conflict")
+            return merged
+    merged["discord_product_details"] = incoming
+    return merged
 
 
 # Machine-readable send-failure categories.  Kept platform-neutral so every
@@ -5459,78 +5544,164 @@ class BasePlatformAdapter(ABC):
         know to retry rather than waiting indefinitely.
         """
 
-        result = await self.send(
-            chat_id=chat_id,
-            content=content,
-            reply_to=reply_to,
-            metadata=metadata,
-        )
+        structured = isinstance(metadata, dict) and "discord_product_details" in metadata
+        routing_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        routing_metadata.pop("discord_product_details", None)
+        routing_metadata.pop("_discord_structured_delivery_handle", None)
+        handle = None
+        terminal_outcome = None
+
+        async def finalize(outcome: str, send_result: Optional[SendResult]) -> None:
+            nonlocal terminal_outcome
+            if handle is None or terminal_outcome is not None:
+                return
+            terminal_outcome = outcome
+            await self._structured_delivery_finalize(
+                handle=handle, outcome=outcome, result=send_result,
+            )
+
+        async def metadata_for_attempt(attempt: int) -> Any:
+            if handle is None:
+                return metadata
+            return await self._structured_delivery_attempt(
+                handle=handle, attempt=attempt, metadata=dict(metadata),
+            )
+
+        if structured:
+            try:
+                handle = await self._structured_delivery_begin(
+                    chat_id=chat_id,
+                    content=content,
+                    reply_to=reply_to,
+                    metadata=dict(metadata),
+                    logical_delivery_id=uuid.uuid4().hex,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "[%s] Structured delivery setup failed; sending public summary only",
+                    self.name,
+                    exc_info=True,
+                )
+                metadata = routing_metadata
+
+        try:
+            result = await self.send(
+                chat_id=chat_id, content=content, reply_to=reply_to,
+                metadata=await metadata_for_attempt(0),
+            )
+        except asyncio.CancelledError:
+            try:
+                await finalize("unknown", None)
+            except Exception:
+                logger.warning(
+                    "[%s] Structured delivery cancellation cleanup failed",
+                    self.name,
+                    exc_info=True,
+                )
+            raise
 
         if result.success:
+            await finalize(
+                "bind_failed" if result.structured_failure == "bind_failed" else "success",
+                result,
+            )
             return result
 
         error_str = result.error or ""
         is_network = result.retryable or self._is_retryable_error(error_str)
+        if handle is not None:
+            certainty = result.delivery_certainty or "unknown"
+            if certainty != "not_sent":
+                await finalize("unknown", result)
+                return result
 
         # Timeout errors are not safe to retry (message may have been
         # delivered) and not formatting errors — return the failure as-is.
         if not is_network and self._is_timeout_error(error_str):
+            await finalize("unknown", result)
             return result
 
         if is_network:
-            # Retry with exponential backoff for transient errors.
-            # Honor server-requested retry_after (e.g. Telegram FloodWait)
-            # when present — it is authoritative over our backoff schedule.
             server_retry_after = result.retry_after
             for attempt in range(1, max_retries + 1):
                 if server_retry_after is not None:
                     delay = server_retry_after + random.uniform(0, 1)
-                    server_retry_after = None  # only honor once per send
+                    server_retry_after = None
                 else:
                     delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 1)
                 logger.warning(
                     "[%s] Send failed (attempt %d/%d, retrying in %.1fs): %s",
                     self.name, attempt, max_retries, delay, error_str,
                 )
-                await asyncio.sleep(delay)
-                result = await self.send(
-                    chat_id=chat_id,
-                    content=content,
-                    reply_to=reply_to,
-                    metadata=metadata,
-                )
+                try:
+                    await asyncio.sleep(delay)
+                    result = await self.send(
+                        chat_id=chat_id, content=content, reply_to=reply_to,
+                        metadata=await metadata_for_attempt(attempt),
+                    )
+                except asyncio.CancelledError:
+                    try:
+                        await finalize("unknown", None)
+                    except Exception:
+                        logger.warning(
+                            "[%s] Structured delivery cancellation cleanup failed",
+                            self.name,
+                            exc_info=True,
+                        )
+                    raise
                 if result.success:
                     logger.info("[%s] Send succeeded on retry %d", self.name, attempt)
+                    await finalize(
+                        "bind_failed" if result.structured_failure == "bind_failed" else "success",
+                        result,
+                    )
                     return result
                 error_str = result.error or ""
+                if handle is not None and (result.delivery_certainty or "unknown") != "not_sent":
+                    await finalize("unknown", result)
+                    return result
                 if result.retry_after is not None:
                     server_retry_after = result.retry_after
                 if not (result.retryable or self._is_retryable_error(error_str)):
-                    break  # error switched to non-transient — fall through to plain-text fallback
+                    break
             else:
-                # All retries exhausted (loop completed without break) — notify user
+                await finalize("not_sent_exhausted", result)
                 logger.error("[%s] Failed to deliver response after %d retries: %s", self.name, max_retries, error_str)
                 notice = (
                     "\u26a0\ufe0f Message delivery failed after multiple attempts. "
                     "Please try again \u2014 your request was processed but the response could not be sent."
                 )
                 try:
-                    await self.send(chat_id=chat_id, content=notice, reply_to=reply_to, metadata=metadata)
+                    await self.send(
+                        chat_id=chat_id, content=notice, reply_to=reply_to,
+                        metadata=routing_metadata,
+                    )
                 except Exception as notify_err:
                     logger.debug("[%s] Could not send delivery-failure notice: %s", self.name, notify_err)
                 return result
 
-        # Non-network / post-retry formatting failure: try plain text as fallback
+        await finalize("not_sent_exhausted", result)
         logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)
         fallback_result = await self.send(
             chat_id=chat_id,
             content=f"(Response formatting failed, plain text:)\n\n{content[:3500]}",
             reply_to=reply_to,
-            metadata=metadata,
+            metadata=routing_metadata,
         )
         if not fallback_result.success:
             logger.error("[%s] Fallback send also failed: %s", self.name, fallback_result.error)
         return fallback_result
+
+    async def _structured_delivery_begin(self, **kwargs: Any) -> object | None:
+        return None
+
+    async def _structured_delivery_attempt(self, **kwargs: Any) -> Any:
+        return kwargs["metadata"]
+
+    async def _structured_delivery_finalize(self, **kwargs: Any) -> None:
+        return None
 
     @staticmethod
     def _merge_caption(existing_text: Optional[str], new_text: str) -> str:
@@ -6249,6 +6420,7 @@ class BasePlatformAdapter(ABC):
 
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
+            response, _gateway_delivery_metadata = _unwrap_gateway_delivery_response(response)
             is_ephemeral_response = isinstance(response, EphemeralReply)
 
             # Slash-command handlers may return an EphemeralReply sentinel to
@@ -6365,6 +6537,10 @@ class BasePlatformAdapter(ABC):
                 # metadata stays unmarked and progress bubbles remain
                 # thread-strict.
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
+                if text_content and not (images or local_files or media_files):
+                    _final_thread_metadata = _merge_gateway_delivery_metadata(
+                        _final_thread_metadata, _gateway_delivery_metadata,
+                    )
 
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Gated via ``_should_auto_tts_for_chat``: fires when the chat has

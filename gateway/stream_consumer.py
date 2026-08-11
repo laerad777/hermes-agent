@@ -41,6 +41,7 @@ logger = logging.getLogger("gateway.stream_consumer")
 
 # Sentinel to signal the stream is complete
 _DONE = object()
+_COMPLETED = object()
 _NEW_SEGMENT = object()
 _COMMENTARY = object()
 
@@ -199,6 +200,7 @@ class GatewayStreamConsumer:
         on_before_finalize: Optional[Callable[[], Any]] = None,
         initial_reply_to_id: Optional[str] = None,
         run_still_current: Optional[Callable[[], bool]] = None,
+        filter_discord_product_details: bool = False,
     ):
         self.adapter = adapter
         self.chat_id = chat_id
@@ -218,6 +220,14 @@ class GatewayStreamConsumer:
         self._on_before_finalize = on_before_finalize
         self._initial_reply_to_id = initial_reply_to_id
         self._queue: queue.Queue = queue.Queue()
+        self._terminal_lock = threading.Lock()
+        self._completion_enqueued = False
+        self._completed_delivery_metadata: dict | None = None
+        if filter_discord_product_details:
+            from gateway.discord_product_details import DiscordProductDetailsStreamFilter
+            self._discord_details_filter = DiscordProductDetailsStreamFilter()
+        else:
+            self._discord_details_filter = None
         self._accumulated = ""
         # Full segment text mirror of ``_accumulated`` that is NOT truncated
         # when overflow splits seal head chunks.  Used to record a reconciliable
@@ -345,6 +355,11 @@ class GatewayStreamConsumer:
             meta["expect_edits"] = True
         if final:
             meta["notify"] = True
+            if self._completed_delivery_metadata:
+                from gateway.platforms.base import _merge_gateway_delivery_metadata
+                meta = _merge_gateway_delivery_metadata(
+                    meta, self._completed_delivery_metadata,
+                )
         return meta or None
 
     @property
@@ -390,7 +405,7 @@ class GatewayStreamConsumer:
         finalize: bool = False,
     ):
         """Edit via the adapter, passing routing metadata when supported."""
-        kwargs = {
+        kwargs: dict[str, Any] = {
             "chat_id": self.chat_id,
             "message_id": message_id,
             "content": content,
@@ -399,14 +414,15 @@ class GatewayStreamConsumer:
         # must accept finalize= even when it is False (guarded by tests).
         kwargs["finalize"] = finalize
 
-        if self.metadata:
+        edit_metadata = self._metadata_for_send(final=finalize)
+        if edit_metadata:
             try:
                 params = inspect.signature(self.adapter.edit_message).parameters
                 if "metadata" in params or any(
                     param.kind is inspect.Parameter.VAR_KEYWORD
                     for param in params.values()
                 ):
-                    kwargs["metadata"] = self.metadata
+                    kwargs["metadata"] = edit_metadata
             except (TypeError, ValueError):
                 pass
         return await self.adapter.edit_message(**kwargs)
@@ -616,13 +632,30 @@ class GatewayStreamConsumer:
         appears below any tool-progress messages the gateway sent in between.
         """
         if text:
-            self._queue.put(text)
+            if self._discord_details_filter is not None:
+                text = self._discord_details_filter.feed(text)
+            if text:
+                self._queue.put(text)
         elif text is None:
             self.on_segment_break()
 
-    def finish(self) -> None:
+    def finish(self) -> bool:
         """Signal that the stream is complete."""
-        self._queue.put(_DONE)
+        with self._terminal_lock:
+            if self._completion_enqueued:
+                return False
+            self._completion_enqueued = True
+            self._queue.put(_DONE)
+            return True
+
+    def complete(self, final_content: str, delivery_metadata: Any = None) -> bool:
+        """Queue the authoritative completed body and terminal event atomically."""
+        with self._terminal_lock:
+            if self._completion_enqueued:
+                return False
+            self._completion_enqueued = True
+            self._queue.put((_COMPLETED, final_content, delivery_metadata))
+            return True
 
     # ── Think-block filtering ────────────────────────────────────────
     # Models like MiniMax emit inline <think>...</think> blocks in their
@@ -827,10 +860,25 @@ class GatewayStreamConsumer:
                 got_flush = False
                 flush_event = None
                 commentary_text = None
+                drained_delta = False
                 while True:
                     try:
                         item = self._queue.get_nowait()
                         if item is _DONE:
+                            got_done = True
+                            break
+                        if isinstance(item, tuple) and len(item) == 3 and item[0] is _COMPLETED:
+                            # Preserve FIFO-visible streaming semantics: if this
+                            # drain already consumed public deltas, render that
+                            # update before the authoritative completed body
+                            # replaces the accumulator on the next iteration.
+                            # Requeueing the single terminal item is safe because
+                            # complete() is guarded by the terminal CAS.
+                            if drained_delta:
+                                self._queue.put(item)
+                                break
+                            self._accumulated = str(item[1] or "")
+                            self._completed_delivery_metadata = item[2]
                             got_done = True
                             break
                         if item is _NEW_SEGMENT:
@@ -847,7 +895,9 @@ class GatewayStreamConsumer:
                             got_segment_break = True
                             flush_event = item[1]
                             break
-                        self._filter_and_accumulate(item)
+                        if isinstance(item, str):
+                            self._filter_and_accumulate(item)
+                            drained_delta = True
                     except queue.Empty:
                         break
 
@@ -1948,7 +1998,7 @@ class GatewayStreamConsumer:
             return False
         try:
             try:
-                result = fn(text, metadata=self.metadata)
+                result = fn(text, metadata=self._metadata_for_send(final=True))
             except TypeError:
                 # Adapter / test double whose hook doesn't accept the metadata
                 # keyword — fall back to the positional-only form.
