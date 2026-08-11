@@ -577,6 +577,24 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
     return bool(_GATEWAY_PROVIDER_ERROR_SHAPE_RE.search(body))
 
 
+def _extract_discord_delivery_payload(source: Any, response: str) -> tuple[str, dict | None]:
+    platform = getattr(source, "platform", None)
+    platform_name = str(getattr(platform, "value", platform) or "").lower()
+    if platform_name != "discord":
+        return response, None
+    from gateway.discord_product_details import extract_discord_product_details
+    parsed = extract_discord_product_details(response)
+    details = parsed.details
+    if details is not None:
+        from dataclasses import replace
+        owner_user_id = str(getattr(source, "user_id", "") or "") or None
+        details = replace(details, owner_user_id=owner_user_id)
+    return parsed.public_text, (
+        {"discord_product_details": details}
+        if details is not None else None
+    )
+
+
 def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     """Sanitize final gateway replies before sending them to chat surfaces.
 
@@ -4391,6 +4409,9 @@ class TurnRunner:
                         on_before_finalize=_pause_typing_before_finalize,
                         initial_reply_to_id=ctx.event_message_id,
                         run_still_current=ctx._run_still_current,
+                        filter_discord_product_details=(
+                            ctx.source.platform == Platform.DISCORD
+                        ),
                     )
                     if _want_stream_deltas:
                         def _stream_delta_cb(text: str) -> None:
@@ -5299,10 +5320,6 @@ class TurnRunner:
                 pass
             reset_current_session_key(_approval_session_token)
         ctx.result_holder[0] = result
-
-        # Signal the stream consumer that the agent is done
-        if _stream_consumer is not None:
-            _stream_consumer.finish()
 
         # Signal the streaming-TTS consumer that the agent is done (#60671).
         # finish() is called from the outer event-loop thread after the
@@ -17301,6 +17318,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
 
             response = agent_result.get("final_response") or ""
+            response, _delivery_metadata = _extract_discord_delivery_payload(source, response)
+            if _delivery_metadata:
+                agent_result["delivery_metadata"] = _delivery_metadata
             # Hidden-reasoning-only retry exhaustion: the loop's sentinel text
             # ("Codex response remained incomplete after 3 continuation
             # attempts") doubles as final_response, so it would be delivered
@@ -17873,8 +17893,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         logger.debug("trailing footer send failed: %s", _e)
                 return None
 
+            if _delivery_metadata:
+                from gateway.platforms.base import _GatewayDeliveryResponse
+                return _GatewayDeliveryResponse(response, delivery_metadata=_delivery_metadata)
             return response
-            
+
         except Exception as e:
             # Stop typing indicator on error too, retaining Slack thread/workspace
             # routing so a failed turn cannot leave its status visible.
@@ -20298,6 +20321,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if team_id:
                 metadata = dict(metadata or {})
                 metadata["slack_team_id"] = str(team_id)
+        elif getattr(source, "platform", None) == Platform.DISCORD:
+            guild_id = getattr(source, "scope_id", None) or getattr(source, "guild_id", None)
+            if guild_id:
+                metadata = dict(metadata or {})
+                metadata["discord_guild_id"] = str(guild_id)
         return metadata
 
     def _thread_metadata_for_target(
@@ -23563,6 +23591,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         on_before_finalize=_pause_typing_before_finalize,
                         initial_reply_to_id=event_message_id,
                         run_still_current=_run_still_current,
+                        filter_discord_product_details=(
+                            source.platform == Platform.DISCORD
+                        ),
                     )
             except Exception as _sc_err:
                 logger.debug("Proxy: could not set up stream consumer: %s", _sc_err)
@@ -23666,9 +23697,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 }
             # Partial response — return what we got
         finally:
-            # Finalize stream consumer
-            if _stream_consumer:
-                _stream_consumer.finish()
+            if _stream_consumer is not None:
+                public, delivery_metadata = _extract_discord_delivery_payload(
+                    source, full_response
+                )
+                _stream_consumer.complete(public, delivery_metadata)
             if stream_task:
                 try:
                     await asyncio.wait_for(stream_task, timeout=5.0)
@@ -23696,7 +23729,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             proxy_url, (session_id or "")[:20], _elapsed, len(full_response),
         )
 
-        return {
+        result = {
             "final_response": full_response or "(No response from remote agent)",
             "messages": [
                 {"role": "user", "content": message},
@@ -23708,6 +23741,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "session_id": session_id,
             "response_previewed": _stream_consumer is not None and bool(full_response),
         }
+        if _stream_consumer is not None:
+            public, delivery_metadata = _extract_discord_delivery_payload(
+                source, result["final_response"]
+            )
+            result["final_response"] = public
+            if delivery_metadata:
+                result["delivery_metadata"] = delivery_metadata
+            _stream_consumer.complete(public, delivery_metadata)
+            if stream_task:
+                try:
+                    await asyncio.wait_for(stream_task, timeout=5.0)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    stream_task.cancel()
+        return result
 
     # ------------------------------------------------------------------
 
@@ -25013,6 +25060,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             result = result_holder[0]
             adapter = self._adapter_for_source(source)
 
+            # The completed agent response is the sole authority for Discord's
+            # private-details trailer.  Queue the marker-free final body and
+            # validated metadata as one terminal item before any queued-turn
+            # handoff or stream-task wait.  The worker must never enqueue the
+            # terminal sentinel first: that races final metadata with delivery.
+            _sc_for_completion = stream_consumer_holder[0]
+            if _sc_for_completion is not None and isinstance(response, dict):
+                _completed_body = response.get("final_response") or ""
+                _completed_body, _completed_metadata = _extract_discord_delivery_payload(
+                    source, _completed_body
+                )
+                response["final_response"] = _completed_body
+                if _completed_metadata:
+                    response["delivery_metadata"] = _completed_metadata
+                if source.platform == Platform.DISCORD:
+                    _sc_for_completion.complete(_completed_body, _completed_metadata)
+                else:
+                    # Preserve every existing platform's streaming cadence;
+                    # only Discord needs an authoritative completed payload to
+                    # carry the quarantined private trailer metadata.
+                    _sc_for_completion.finish()
+
             # Finalize the streaming-TTS consumer (#60671).
             #
             # finish() is called from the outer event-loop thread (not the
@@ -25475,6 +25544,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _final,
                 previewed=_previewed,
             )
+            _reconcile_metadata = dict(getattr(_sc, "metadata", None) or {})
+            _delivery_metadata = response.get("delivery_metadata")
+            if _delivery_metadata:
+                from gateway.platforms.base import _merge_gateway_delivery_metadata
+                _reconcile_metadata = _merge_gateway_delivery_metadata(
+                    _reconcile_metadata, _delivery_metadata,
+                )
             if not _is_empty_sentinel and not _transformed and (_streamed or _content_delivered):
                 logger.info(
                     "Suppressing normal final send for session %s: final delivery already confirmed (streamed=%s previewed=%s content_delivered=%s).",
@@ -25500,6 +25576,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             message_id=_sc_msg_id,
                             content=_final,
                             finalize=True,
+                            metadata=_reconcile_metadata or None,
                         )
                         if getattr(_reconcile_res, "success", True):
                             response["already_sent"] = True
@@ -25534,6 +25611,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             message_id=_sc_msg_id,
                             content=response["final_response"],
                             finalize=True,
+                            metadata=_reconcile_metadata or None,
                         )
                         response["already_sent"] = True
                         logger.info(
