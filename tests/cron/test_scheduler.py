@@ -1427,6 +1427,259 @@ class TestDeliverResultLiveAdapterUnconfirmed:
         standalone_send.assert_awaited_once()
 
 
+def test_live_discord_cron_poll_strips_marker_and_never_uses_standalone_fallback():
+    import asyncio
+    import base64
+    import json
+    from concurrent.futures import Future
+    from gateway.config import Platform
+    from gateway.platforms.base import SendResult
+
+    adapter = MagicMock()
+    adapter._send_with_retry = AsyncMock(return_value=SendResult(
+        success=False, error="already claimed", delivery_certainty="unknown",
+        structured_failure="poll_already_claimed",
+    ))
+    pconfig = MagicMock(enabled=True, extra={})
+    mock_cfg = MagicMock()
+    mock_cfg.platforms = {Platform.DISCORD: pconfig}
+    loop = MagicMock()
+    loop.is_running.return_value = True
+    raw = json.dumps({
+        "kind": "poll",
+        "payload": {
+            "question": "Ship?",
+            "answers": [{"text": "Yes"}, {"text": "No"}],
+            "duration_hours": 24,
+        },
+    }, sort_keys=True, separators=(",", ":")).encode()
+    marker = base64.urlsafe_b64encode(raw).decode().rstrip("=")
+    response = f"same summary\n<!--HERMES_DISCORD_NATIVE:v1:{marker}-->"
+
+    def fake_schedule(coro, _loop):
+        future = Future()
+        try:
+            future.set_result(asyncio.run(coro))
+        except Exception as exc:
+            future.set_exception(exc)
+        return future
+
+    job = {
+        "id": "poll-job", "execution_id": "run-1", "deliver": "origin",
+        "origin": {"platform": "discord", "chat_id": "8"},
+    }
+    standalone_send = AsyncMock(return_value={"success": True})
+    with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+         patch("cron.scheduler.load_config", return_value={}), \
+         patch("agent.async_utils.safe_schedule_threadsafe", side_effect=fake_schedule), \
+         patch("tools.send_message_tool._send_to_platform", new=standalone_send):
+        error = _deliver_result(
+            job, response, adapters={Platform.DISCORD: adapter}, loop=loop,
+        )
+
+    assert error is not None
+    standalone_send.assert_not_awaited()
+    sent = adapter._send_with_retry.await_args.kwargs
+    assert "Cronjob Response: poll-job" in sent["content"]
+    assert "same summary" in sent["content"]
+    assert "<!--HERMES_DISCORD_NATIVE" not in sent["content"]
+    assert sent["metadata"]["_discord_delivery_obligation_id"] == "cron:poll-job:run-1"
+    assert sent["metadata"]["_discord_native_route"] == "cron_live"
+    assert sent["metadata"]["discord_native_payload"].kind == "poll"
+
+
+def test_live_discord_cron_poll_extracts_raw_marker_before_default_wrapper():
+    import asyncio
+    import base64
+    from concurrent.futures import Future
+    from gateway.config import Platform
+    from gateway.platforms.base import SendResult
+
+    adapter = MagicMock()
+    adapter._send_with_retry = AsyncMock(return_value=SendResult(
+        success=True, message_id="9", delivery_certainty="delivered",
+    ))
+    pconfig = MagicMock(enabled=True, extra={})
+    mock_cfg = MagicMock()
+    mock_cfg.platforms = {Platform.DISCORD: pconfig}
+    loop = MagicMock()
+    loop.is_running.return_value = True
+    raw = json.dumps({
+        "kind": "poll",
+        "payload": {
+            "question": "Ship?",
+            "answers": [{"text": "Yes"}, {"text": "No"}],
+            "duration_hours": 24,
+        },
+    }, sort_keys=True, separators=(",", ":")).encode()
+    marker = base64.urlsafe_b64encode(raw).decode().rstrip("=")
+    response = f"public summary\n<!--HERMES_DISCORD_NATIVE:v1:{marker}-->"
+
+    def fake_schedule(coro, _loop):
+        future = Future()
+        try:
+            future.set_result(asyncio.run(coro))
+        except Exception as exc:
+            future.set_exception(exc)
+        return future
+
+    job = {
+        "id": "poll-job", "name": "Wrapped Poll", "execution_id": "run-1",
+        "deliver": "origin",
+        "origin": {"platform": "discord", "chat_id": "8"},
+    }
+    standalone_send = AsyncMock(return_value={"success": True})
+    with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+         patch("cron.scheduler.load_config", return_value={}), \
+         patch("agent.async_utils.safe_schedule_threadsafe", side_effect=fake_schedule), \
+         patch("tools.send_message_tool._send_to_platform", new=standalone_send):
+        error = _deliver_result(
+            job, response, adapters={Platform.DISCORD: adapter}, loop=loop,
+        )
+
+    assert error is None
+    standalone_send.assert_not_awaited()
+    sent = adapter._send_with_retry.await_args.kwargs
+    assert sent["metadata"]["discord_native_payload"].kind == "poll"
+    assert "<!--HERMES_DISCORD_NATIVE" not in sent["content"]
+    assert "Cronjob Response: Wrapped Poll" in sent["content"]
+    assert "public summary" in sent["content"]
+    assert "To stop or manage this job" in sent["content"]
+
+
+def test_live_discord_cron_legacy_details_extracts_before_default_wrapper():
+    import asyncio
+    import base64
+    import json
+    from concurrent.futures import Future
+    from gateway.config import Platform
+    from gateway.platforms.base import SendResult
+
+    adapter = MagicMock()
+    adapter.send = AsyncMock(return_value=SendResult(
+        success=True, message_id="9", delivery_certainty="delivered",
+    ))
+    pconfig = MagicMock(enabled=True, extra={})
+    mock_cfg = MagicMock()
+    mock_cfg.platforms = {Platform.DISCORD: pconfig}
+    loop = MagicMock()
+    loop.is_running.return_value = True
+    raw = json.dumps({
+        "items": [{"label": "one", "title": "A", "body": "secret"}],
+        "ttl_seconds": 60,
+    }, sort_keys=True, separators=(",", ":")).encode()
+    marker = base64.urlsafe_b64encode(raw).decode().rstrip("=")
+    response = f"public summary\n<!--HERMES_DISCORD_DETAILS:v1:{marker}-->"
+
+    def fake_schedule(coro, _loop):
+        future = Future()
+        try:
+            future.set_result(asyncio.run(coro))
+        except Exception as exc:
+            future.set_exception(exc)
+        return future
+
+    job = {
+        "id": "details-job", "name": "Wrapped Details", "execution_id": "run-1",
+        "deliver": "origin",
+        "origin": {"platform": "discord", "chat_id": "8", "user_id": "42"},
+    }
+    standalone_send = AsyncMock(return_value={"success": True})
+    with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+         patch("cron.scheduler.load_config", return_value={}), \
+         patch("agent.async_utils.safe_schedule_threadsafe", side_effect=fake_schedule), \
+         patch("tools.send_message_tool._send_to_platform", new=standalone_send):
+        error = _deliver_result(
+            job, response, adapters={Platform.DISCORD: adapter}, loop=loop,
+        )
+
+    assert error is None
+    standalone_send.assert_not_awaited()
+    sent = adapter.send.await_args.kwargs
+    details = sent["metadata"]["discord_product_details"]
+    assert details.owner_user_id == "42"
+    assert details.items[0].body == "secret"
+    sent_content = adapter.send.await_args.args[1]
+    assert "<!--HERMES_DISCORD_DETAILS" not in sent_content
+    assert "Cronjob Response: Wrapped Details" in sent_content
+    assert "public summary" in sent_content
+
+
+def test_live_discord_cron_component_extracts_before_default_wrapper():
+    import asyncio
+    import base64
+    from concurrent.futures import Future
+    from gateway.config import Platform
+    from gateway.platforms.base import SendResult
+
+    adapter = MagicMock()
+    adapter._send_with_retry = AsyncMock(return_value=SendResult(
+        success=True, message_id="9", delivery_certainty="delivered",
+    ))
+    pconfig = MagicMock(enabled=True, extra={})
+    mock_cfg = MagicMock()
+    mock_cfg.platforms = {Platform.DISCORD: pconfig}
+    loop = MagicMock()
+    loop.is_running.return_value = True
+    raw = json.dumps({
+        "kind": "user_select", "payload": {"ttl_seconds": 60},
+    }, sort_keys=True, separators=(",", ":")).encode()
+    marker = base64.urlsafe_b64encode(raw).decode().rstrip("=")
+    response = f"choose a user\n<!--HERMES_DISCORD_NATIVE:v1:{marker}-->"
+
+    def fake_schedule(coro, _loop):
+        future = Future()
+        try:
+            future.set_result(asyncio.run(coro))
+        except Exception as exc:
+            future.set_exception(exc)
+        return future
+
+    job = {
+        "id": "component-job", "execution_id": "run-1", "deliver": "origin",
+        "origin": {"platform": "discord", "chat_id": "8", "user_id": "42"},
+    }
+    with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+         patch("cron.scheduler.load_config", return_value={}), \
+         patch("agent.async_utils.safe_schedule_threadsafe", side_effect=fake_schedule):
+        assert _deliver_result(
+            job, response, adapters={Platform.DISCORD: adapter}, loop=loop,
+        ) is None
+
+    sent = adapter._send_with_retry.await_args.kwargs
+    payload = sent["metadata"]["discord_native_payload"]
+    assert payload.kind == "user_select"
+    assert payload.owner_user_id == "42"
+    assert "Cronjob Response: component-job" in sent["content"]
+    assert "choose a user" in sent["content"]
+    assert "<!--HERMES_DISCORD_NATIVE" not in sent["content"]
+
+
+def test_cron_invalid_native_marker_quarantines_trailer_before_wrapper():
+    from gateway.config import Platform
+
+    pconfig = MagicMock(enabled=True, extra={})
+    mock_cfg = MagicMock()
+    mock_cfg.platforms = {Platform.DISCORD: pconfig}
+    standalone_send = AsyncMock(return_value={"success": True})
+    job = {
+        "id": "invalid-job", "deliver": "origin",
+        "origin": {"platform": "discord", "chat_id": "8"},
+    }
+    with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+         patch("cron.scheduler.load_config", return_value={}), \
+         patch("tools.send_message_tool._send_to_platform", new=standalone_send):
+        assert _deliver_result(
+            job, "safe\n<!--HERMES_DISCORD_NATIVE:v1:invalid-->leak",
+        ) is None
+
+    assert standalone_send.await_args is not None
+    sent_content = standalone_send.await_args.args[3]
+    assert "safe" in sent_content
+    assert "<!--HERMES_DISCORD_NATIVE" not in sent_content
+    assert "leak" not in sent_content
+
+
 class TestDeliverOriginUnresolvableIsLocal:
     """Regression for #43014.
 

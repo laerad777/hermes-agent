@@ -81,8 +81,12 @@ async def test_send_retries_without_reference_when_reply_target_is_deleted():
     sent_msgs = [SimpleNamespace(id=1001), SimpleNamespace(id=1002)]
     send_calls = []
 
-    async def fake_send(*, content, reference=None):
-        send_calls.append({"content": content, "reference": reference})
+    async def fake_send(*, content, reference=None, allowed_mentions=None):
+        send_calls.append({
+            "content": content,
+            "reference": reference,
+            "allowed_mentions": allowed_mentions,
+        })
         if len(send_calls) == 1:
             raise RuntimeError(
                 "400 Bad Request (error code: 10008): Unknown Message"

@@ -224,8 +224,8 @@ class GatewayStreamConsumer:
         self._completion_enqueued = False
         self._completed_delivery_metadata: dict | None = None
         if filter_discord_product_details:
-            from gateway.discord_product_details import DiscordProductDetailsStreamFilter
-            self._discord_details_filter = DiscordProductDetailsStreamFilter()
+            from gateway.discord_native import DiscordNativeStreamFilter
+            self._discord_details_filter = DiscordNativeStreamFilter()
         else:
             self._discord_details_filter = None
         self._accumulated = ""
@@ -420,6 +420,61 @@ class GatewayStreamConsumer:
             except (TypeError, ValueError):
                 pass
         return await self.adapter.edit_message(**kwargs)
+
+    def _completed_native_kind(self) -> str | None:
+        """Return the finalized Discord native kind, if one was supplied."""
+        metadata = self._completed_delivery_metadata
+        native = metadata.get("discord_native_payload") if isinstance(metadata, dict) else None
+        if isinstance(native, dict):
+            return native.get("kind")
+        return getattr(native, "kind", None)
+
+    async def _defer_completed_poll_to_ordinary_delivery(self) -> None:
+        """Clean a streaming preview without acknowledging Poll delivery.
+
+        Discord Poll creation is send-only.  A successful plain-text edit must
+        therefore never set the stream delivery flags and suppress the ordinary
+        poll path, which owns the authoritative obligation and durable ledger.
+        """
+        preview_ids = set(self._preview_message_ids)
+        if self._message_id and self._message_id != "__no_edit__":
+            preview_ids.add(str(self._message_id))
+        # Snapshot once: cleanup can mutate adapter/consumer state, and each
+        # visible preview must be attempted exactly once without one failure
+        # preventing the remaining previews from being neutralized.
+        stale_ids = tuple(sorted(preview_ids))
+        delete_impl = getattr(type(self.adapter), "delete_message", None)
+        can_delete = (
+            delete_impl is not None
+            and delete_impl is not _BasePlatformAdapter.delete_message
+        )
+        for message_id in stale_ids:
+            deleted = False
+            if can_delete:
+                try:
+                    deleted = bool(
+                        await self.adapter.delete_message(self.chat_id, message_id)
+                    )
+                except Exception as exc:
+                    logger.debug("Poll preview delete failed (%s): %s", message_id, exc)
+
+            if not deleted:
+                # Replace the model body with a fixed, marker-free placeholder
+                # so the sole authoritative body is attached to the Poll.
+                try:
+                    result = await self._edit_message(
+                        message_id=message_id, content="…"
+                    )
+                    if getattr(result, "success", False):
+                        self._last_sent_text = "…"
+                except Exception as exc:
+                    logger.debug(
+                        "Poll preview neutralization failed (%s): %s",
+                        message_id,
+                        exc,
+                    )
+        self._preview_message_ids = set()
+        self._segment_preview_message_ids = set()
 
     def _record_turn_final_payload(self, text: str) -> None:
         """Record the exact cleaned payload of a turn-final delivery.
@@ -878,6 +933,17 @@ class GatewayStreamConsumer:
                         self._clean_for_display(self._accumulated)
                     ):
                         await self._suppress_silence_marker()
+                        return
+
+                    # Polls cannot be created by editing an existing Discord
+                    # message.  Defer the complete body+metadata to the normal
+                    # send path instead of accepting a successful text edit as
+                    # structured delivery.
+                    if self._completed_native_kind() == "poll":
+                        await self._defer_completed_poll_to_ordinary_delivery()
+                        self._final_response_sent = False
+                        self._final_content_delivered = False
+                        self._delivered_final_text = None
                         return
 
                 # Decide whether to flush an edit
