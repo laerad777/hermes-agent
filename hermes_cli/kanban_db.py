@@ -11355,6 +11355,28 @@ def _block_preflight_failure(
             _append_event(conn, task_id, "preflight_failed", {"error": clean})
 
 
+def _ready_dispatch_decision(
+    conn: sqlite3.Connection,
+    task: Task,
+    *,
+    per_profile_cap: Optional[int],
+    per_profile_running: dict[str, int],
+) -> tuple[str, Optional[int | str]]:
+    """Classify a ready task using the authoritative live ordering."""
+    assignee = task.assignee or ""
+    if per_profile_cap is not None:
+        current = per_profile_running.get(assignee, 0)
+        if current >= per_profile_cap:
+            return "per_profile_capped", current
+    guard_reason = check_respawn_guard(conn, task.id)
+    if guard_reason is not None:
+        return "respawn_guarded", guard_reason
+    preflight_error = _dispatch_preflight_error(task)
+    if preflight_error:
+        return "preflight_failed", preflight_error
+    return "spawnable", None
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -11617,59 +11639,25 @@ def _dispatch_once_locked(
             else:
                 result.skipped_unassigned.append(row["id"])
                 continue
-        # Dry-run evaluates the same deterministic preflight as live dispatch,
-        # but reports the outcome instead of mutating the task. Preserve the
-        # live ordering below so capacity/respawn deferrals remain unchanged.
-        if dry_run:
-            task_for_preflight = get_task(conn, row["id"])
-            if task_for_preflight is None:
-                continue
-            # A dry-run default assignment is intentionally not persisted.
-            task_for_preflight.assignee = row_assignee
-            preflight_error = _dispatch_preflight_error(task_for_preflight)
-            if preflight_error:
-                result.preflight_failed.append((row["id"], preflight_error))
-                continue
-        # Skip ready tasks whose assignee is not a real Hermes profile.
-        # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
-        # with "Profile 'X' does not exist" when the assignee names a
-        # control-plane lane rather than a Hermes profile.
-        try:
-            from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if (
-            not dry_run
-            and profile_exists is not None
-            and not profile_exists(row_assignee)
-        ):
-            preflight_error = f"unknown profile '{row_assignee}'"
-            result.preflight_failed.append((row["id"], preflight_error))
-            _block_preflight_failure(conn, row["id"], preflight_error)
+        task_for_preflight = get_task(conn, row["id"])
+        if task_for_preflight is None:
             continue
-        # Per-profile concurrency cap (#21582): even if there's global
-        # headroom, refuse to spawn for an assignee that's already at
-        # its in-flight cap. Prevents one profile's local model / API
-        # quota / browser pool from being overwhelmed by a fan-out
-        # while the global max_in_progress / max_spawn caps still allow
-        # work on OTHER profiles.
-        if _per_profile_cap is not None:
-            current = _per_profile_running.get(row_assignee, 0)
-            if current >= _per_profile_cap:
-                result.skipped_per_profile_capped.append(
-                    (row["id"], row_assignee, current)
-                )
-                continue
-        # Respawn guard: refuse to re-spawn when useful work is already
-        # in-flight/recent, or when the last failure is a deterministic
-        # blocker (quota / auth). The guard defers the spawn this tick so
-        # the task gets a chance to clear (rate limits often reset in
-        # seconds-to-minutes); the existing consecutive_failures counter
-        # still trips the auto-block circuit breaker after failure_limit
-        # consecutive failures, so a persistent auth error eventually
-        # blocks via the normal path rather than on first occurrence.
-        guard_reason = check_respawn_guard(conn, row["id"])
-        if guard_reason is not None:
+        # A dry-run default assignment is intentionally not persisted.
+        task_for_preflight.assignee = row_assignee
+        decision, detail = _ready_dispatch_decision(
+            conn,
+            task_for_preflight,
+            per_profile_cap=_per_profile_cap,
+            per_profile_running=_per_profile_running,
+        )
+        if decision == "per_profile_capped":
+            assert isinstance(detail, int)
+            result.skipped_per_profile_capped.append(
+                (row["id"], row_assignee, detail)
+            )
+            continue
+        if decision == "respawn_guarded":
+            guard_reason = str(detail)
             result.respawn_guarded.append((row["id"], guard_reason))
             # Emit an event so operators can see why the task was
             # skipped when reading `hermes kanban tail` — without
@@ -11680,6 +11668,12 @@ def _dispatch_once_locked(
                         conn, row["id"], "respawn_guarded",
                         {"reason": guard_reason},
                     )
+            continue
+        if decision == "preflight_failed":
+            preflight_error = str(detail)
+            result.preflight_failed.append((row["id"], preflight_error))
+            if not dry_run:
+                _block_preflight_failure(conn, row["id"], preflight_error)
             continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
@@ -11692,14 +11686,6 @@ def _dispatch_once_locked(
                 _per_profile_running[row_assignee] = (
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
-            continue
-        task_for_preflight = get_task(conn, row["id"])
-        if task_for_preflight is None:
-            continue
-        preflight_error = _dispatch_preflight_error(task_for_preflight)
-        if preflight_error:
-            result.preflight_failed.append((row["id"], preflight_error))
-            _block_preflight_failure(conn, row["id"], preflight_error)
             continue
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:

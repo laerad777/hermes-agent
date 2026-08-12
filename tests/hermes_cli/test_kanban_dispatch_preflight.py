@@ -193,6 +193,93 @@ def test_valid_preflight_preserves_per_profile_capacity(isolated_board):
     assert kb.get_task(conn, second).status == "ready"
 
 
+@pytest.mark.parametrize(
+    ("deferral", "task_kwargs", "config"),
+    [
+        ("cap", {"assignee": "missing-profile"}, None),
+        ("cap", {"skills": ["missing-skill"]}, None),
+        ("cap", {}, "platform_toolsets:\n  cli:\n    - missing-toolset\n"),
+        ("guard", {"assignee": "missing-profile"}, None),
+        ("guard", {"skills": ["missing-skill"]}, None),
+        ("guard", {}, "platform_toolsets:\n  cli:\n    - missing-toolset\n"),
+    ],
+)
+def test_ready_deferral_precedes_preflight_with_dry_run_live_parity(
+    isolated_board,
+    monkeypatch,
+    deferral,
+    task_kwargs,
+    config,
+):
+    conn, home = isolated_board
+    if config:
+        (home / "config.yaml").write_text(config, encoding="utf-8")
+    task_id = _ready_task(conn, **task_kwargs)
+    assignee = task_kwargs.get("assignee", "default")
+    reconcile_orphans = False
+    max_in_progress_per_profile = None
+
+    if deferral == "cap":
+        running_id = _ready_task(conn, assignee=assignee, status="running")
+        max_in_progress_per_profile = 1
+        expected_bucket = [(task_id, assignee, 1)]
+    else:
+        running_id = None
+        monkeypatch.setattr(
+            kb,
+            "check_respawn_guard",
+            lambda _conn, candidate_id, **_kw: (
+                "rate_limit_cooldown" if candidate_id == task_id else None
+            ),
+        )
+        expected_bucket = [(task_id, "rate_limit_cooldown")]
+
+    before = conn.serialize()
+    dry = kb.dispatch_once(
+        conn,
+        dry_run=True,
+        reconcile_orphans=reconcile_orphans,
+        max_in_progress_per_profile=max_in_progress_per_profile,
+    )
+
+    assert conn.serialize() == before
+    assert dry.preflight_failed == []
+    if deferral == "cap":
+        assert dry.skipped_per_profile_capped == expected_bucket
+        assert dry.respawn_guarded == []
+    else:
+        assert dry.respawn_guarded == expected_bucket
+        assert dry.skipped_per_profile_capped == []
+
+    live = kb.dispatch_once(
+        conn,
+        spawn_fn=lambda *_args: 123,
+        reconcile_orphans=reconcile_orphans,
+        max_in_progress_per_profile=max_in_progress_per_profile,
+    )
+
+    assert live.preflight_failed == dry.preflight_failed
+    assert live.skipped_per_profile_capped == dry.skipped_per_profile_capped
+    assert live.respawn_guarded == dry.respawn_guarded
+    task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "ready"
+    assert task.current_run_id is None
+    assert task.last_failure_error is None
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_runs WHERE task_id=?", (task_id,),
+    ).fetchone()[0] == 0
+    events = kb.list_events(conn, task_id)
+    assert not any(event.kind == "preflight_failed" for event in events)
+    assert sum(event.kind == "respawn_guarded" for event in events) == (
+        1 if deferral == "guard" else 0
+    )
+    if running_id is not None:
+        running_task = kb.get_task(conn, running_id)
+        assert running_task is not None
+        assert running_task.status == "running"
+
+
 def test_immediate_spawn_exit_is_recorded_with_log_tail(isolated_board, tmp_path, monkeypatch):
     conn, _home = isolated_board
     task_id = _ready_task(conn)
