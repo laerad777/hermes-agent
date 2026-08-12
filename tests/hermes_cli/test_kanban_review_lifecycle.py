@@ -33,6 +33,23 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Isolated HERMES_HOME with an empty kanban DB."""
     home = tmp_path / ".hermes"
     home.mkdir()
+    review_skill = home / "skills" / "sdlc-review"
+    review_skill.mkdir(parents=True)
+    (review_skill / "SKILL.md").write_text(
+        "---\nname: sdlc-review\ndescription: Review changes.\n---\n# Review\n",
+        encoding="utf-8",
+    )
+    profiles_root = tmp_path / ".hermes" / "profiles"
+    for name in ("worker", "reviewer", "builder"):
+        profile = profiles_root / name
+        profile.mkdir(parents=True)
+        (profile / "config.yaml").write_text("{}\n", encoding="utf-8")
+        profile_review_skill = profile / "skills" / "sdlc-review"
+        profile_review_skill.mkdir(parents=True)
+        (profile_review_skill / "SKILL.md").write_text(
+            "---\nname: sdlc-review\ndescription: Review changes.\n---\n# Review\n",
+            encoding="utf-8",
+        )
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
@@ -488,7 +505,7 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
         lambda *args, **kwargs: {"kanban": {"review_dispatch": True}},
     )
     reviewer_profile = kanban_home / "profiles" / "reviewer"
-    reviewer_profile.mkdir(parents=True)
+    reviewer_profile.mkdir(parents=True, exist_ok=True)
     (reviewer_profile / "config.yaml").write_text("{}\n", encoding="utf-8")
     domain_skill = reviewer_profile / "skills" / "domain-specific-review"
     domain_skill.mkdir(parents=True)
@@ -498,7 +515,7 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
         encoding="utf-8",
     )
     bundled_review_skill = reviewer_profile / "skills" / "sdlc-review"
-    bundled_review_skill.mkdir(parents=True)
+    bundled_review_skill.mkdir(parents=True, exist_ok=True)
     (bundled_review_skill / "SKILL.md").write_text(
         "---\nname: sdlc-review\ndescription: Review changes.\n---\n# Review\n",
         encoding="utf-8",

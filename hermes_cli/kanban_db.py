@@ -9024,6 +9024,10 @@ class DispatchResult:
     dead/gone worker). See the reconciliation pass for details."""
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """List of ``(task_id, assignee, workspace_path)`` triples."""
+    preflight_failed: list[tuple[str, str]] = field(default_factory=list)
+    """Tasks rejected by deterministic worker preflight, as
+    ``(task_id, error)`` pairs. Dry-runs populate this bucket without
+    mutating task status; live dispatch also blocks the task."""
     skipped_unassigned: list[str] = field(default_factory=list)
     """Ready task ids skipped because they have no assignee at all.
     Operator-actionable — usually a misfiled task waiting for routing."""
@@ -11613,16 +11617,23 @@ def _dispatch_once_locked(
             else:
                 result.skipped_unassigned.append(row["id"])
                 continue
+        # Dry-run evaluates the same deterministic preflight as live dispatch,
+        # but reports the outcome instead of mutating the task. Preserve the
+        # live ordering below so capacity/respawn deferrals remain unchanged.
+        if dry_run:
+            task_for_preflight = get_task(conn, row["id"])
+            if task_for_preflight is None:
+                continue
+            # A dry-run default assignment is intentionally not persisted.
+            task_for_preflight.assignee = row_assignee
+            preflight_error = _dispatch_preflight_error(task_for_preflight)
+            if preflight_error:
+                result.preflight_failed.append((row["id"], preflight_error))
+                continue
         # Skip ready tasks whose assignee is not a real Hermes profile.
         # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
         # with "Profile 'X' does not exist" when the assignee names a
-        # control-plane lane (e.g. an interactive Claude Code terminal
-        # like ``orion-cc`` / ``orion-research``) rather than a Hermes
-        # profile. Those task lanes are pulled by terminals via
-        # ``claim_task`` directly and should NEVER auto-spawn — the
-        # subprocess would crash on startup, get reaped as a zombie,
-        # the task would loop back to ``ready`` on next tick, and we'd
-        # burn CPU forever (#kanban-dispatcher-crash-loop 2026-05-05).
+        # control-plane lane rather than a Hermes profile.
         try:
             from hermes_cli.profiles import profile_exists  # local import: avoids cycle
         except Exception:
@@ -11632,9 +11643,9 @@ def _dispatch_once_locked(
             and profile_exists is not None
             and not profile_exists(row_assignee)
         ):
-            _block_preflight_failure(
-                conn, row["id"], f"unknown profile '{row_assignee}'",
-            )
+            preflight_error = f"unknown profile '{row_assignee}'"
+            result.preflight_failed.append((row["id"], preflight_error))
+            _block_preflight_failure(conn, row["id"], preflight_error)
             continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
@@ -11687,6 +11698,7 @@ def _dispatch_once_locked(
             continue
         preflight_error = _dispatch_preflight_error(task_for_preflight)
         if preflight_error:
+            result.preflight_failed.append((row["id"], preflight_error))
             _block_preflight_failure(conn, row["id"], preflight_error)
             continue
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
@@ -11824,14 +11836,6 @@ def _dispatch_once_locked(
                         {"reason": guard_reason},
                     )
             continue
-        if dry_run:
-            result.spawned.append((row["id"], row["assignee"], ""))
-            spawned += 1
-            if _per_profile_cap is not None:
-                _per_profile_running[row["assignee"]] = (
-                    _per_profile_running.get(row["assignee"], 0) + 1
-                )
-            continue
         task_for_preflight = get_task(conn, row["id"])
         if task_for_preflight is None:
             continue
@@ -11840,7 +11844,17 @@ def _dispatch_once_locked(
             task_for_preflight.skills.append("sdlc-review")
         preflight_error = _dispatch_preflight_error(task_for_preflight)
         if preflight_error:
-            _block_preflight_failure(conn, row["id"], preflight_error)
+            result.preflight_failed.append((row["id"], preflight_error))
+            if not dry_run:
+                _block_preflight_failure(conn, row["id"], preflight_error)
+            continue
+        if dry_run:
+            result.spawned.append((row["id"], row["assignee"], ""))
+            spawned += 1
+            if _per_profile_cap is not None:
+                _per_profile_running[row["assignee"]] = (
+                    _per_profile_running.get(row["assignee"], 0) + 1
+                )
             continue
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:

@@ -2656,6 +2656,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": tid, "assignee": who, "workspace": ws}
                 for (tid, who, ws) in res.spawned
             ],
+            "preflight_failed": [
+                {"task_id": tid, "error": error}
+                for (tid, error) in res.preflight_failed
+            ],
             "skipped_unassigned": res.skipped_unassigned,
             "skipped_nonspawnable": res.skipped_nonspawnable,
             "skipped_per_profile_capped": [
@@ -2683,6 +2687,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     for tid, who, ws in res.spawned:
         tag = " (dry)" if args.dry_run else ""
         print(f"  - {tid}  ->  {who}  @ {ws or '-'}{tag}")
+    for tid, error in res.preflight_failed:
+        tag = " (dry, no status change)" if args.dry_run else " (blocked)"
+        print(f"Preflight failed: {tid}: {error}{tag}")
     if res.auto_assigned_default:
         print(
             f"Auto-assigned to kanban.default_assignee={default_assignee!r}: "

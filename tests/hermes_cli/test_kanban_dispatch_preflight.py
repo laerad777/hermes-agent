@@ -62,6 +62,32 @@ def test_unknown_profile_fails_before_claim(isolated_board):
     _assert_preflight_blocked_without_run(conn, task_id, "unknown profile 'missing-profile'")
 
 
+def test_dry_run_reports_unknown_profile_preflight_without_mutation(isolated_board):
+    conn, _home = isolated_board
+    task_id = _ready_task(conn, assignee="missing-profile")
+    spawned = []
+
+    result = kb.dispatch_once(
+        conn,
+        spawn_fn=lambda *args: spawned.append(args) or 123,
+        dry_run=True,
+    )
+
+    assert spawned == []
+    assert result.spawned == []
+    assert result.preflight_failed == [
+        (task_id, "unknown profile 'missing-profile'"),
+    ]
+    task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "ready"
+    assert task.last_failure_error is None
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='preflight_failed'",
+        (task_id,),
+    ).fetchone()[0] == 0
+
+
 def test_unknown_forced_skill_fails_before_claim(isolated_board):
     conn, _home = isolated_board
     task_id = _ready_task(conn, skills=["missing-skill"])
