@@ -438,9 +438,11 @@ display:
   tool_progress_command: false  # set to true to enable /verbose in messaging
   # How progress is grouped on platforms that support message editing:
   #   accumulate (default) — edit one bubble in place as tools run
+  #   replace              — keep one bubble showing only the current tool kind;
+  #                          arguments, previews, commands, paths, and tracebacks are hidden
   #   separate             — send one message per tool (pre-v0.9 style; noisier)
   # Only applies where tool_progress is already enabled.
-  tool_progress_grouping: accumulate   # accumulate | separate
+  tool_progress_grouping: accumulate   # accumulate | replace | separate
 ```
 
 ### `log` mode — audit file instead of chat messages

@@ -275,6 +275,22 @@ class TestToolProgressGrouping:
             == "separate"
         )
 
+    def test_platform_replace(self):
+        """Replace mode is preserved so the renderer can show only the current tool."""
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "platforms": {
+                    "discord": {"tool_progress_grouping": "replace"},
+                }
+            }
+        }
+        assert (
+            resolve_display_setting(config, "discord", "tool_progress_grouping")
+            == "replace"
+        )
+
 
 class TestReasoningStyle:
     """Per-platform reasoning render style (code | blockquote | subtext)."""

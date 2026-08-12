@@ -231,6 +231,37 @@ class FakeAgent:
         }
 
 
+class ReplaceProgressAgent:
+    """Emit detail-heavy progress so replace mode can prove it leaks none of it."""
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.tool_progress_callback
+        assert cb is not None
+        cb(
+            "tool.started",
+            "terminal",
+            "python -c 'raise RuntimeError(\"private detail\")'",
+            {"command": "python -c 'raise RuntimeError(\"private detail\")'"},
+        )
+        time.sleep(1.7)
+        cb(
+            "tool.started",
+            "read_file",
+            "Traceback (most recent call last): /private/path",
+            {"path": "/private/path"},
+        )
+        time.sleep(0.35)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class ThinkingAgent:
     """Agent that emits _thinking scratch text (no tool calls).
 
@@ -974,6 +1005,40 @@ async def _run_with_agent(
         session_key=session_key,
     )
     return adapter, result
+
+
+@pytest.mark.asyncio
+async def test_replace_progress_shows_only_current_tool_kind(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        ReplaceProgressAgent,
+        session_id="sess-progress-replace-current-tool",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "tool_progress_grouping": "replace",
+                "cleanup_progress": False,
+                "interim_assistant_messages": False,
+            }
+        },
+        platform=Platform.DISCORD,
+        chat_id="12345",
+        chat_type="group",
+        thread_id="",
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent
+    assert "terminal" in adapter.sent[0]["content"]
+    assert "private detail" not in adapter.sent[0]["content"]
+    assert adapter.edits
+
+    latest = adapter.edits[-1]["content"]
+    assert "read_file" in latest
+    assert "terminal" not in latest
+    assert "Traceback" not in latest
+    assert "/private/path" not in latest
 
 
 @pytest.mark.asyncio
@@ -1830,4 +1895,3 @@ async def test_transformed_streamed_poll_skips_all_reconciliation_edits(
     assert result["delivery_metadata"]["discord_native_payload"].kind == "poll"
     assert [edit["content"] for edit in adapter.edits] == ["…"]
     assert all("HERMES_DISCORD" not in str(call) for call in adapter.sent + adapter.edits)
-

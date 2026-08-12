@@ -32,7 +32,10 @@ from typing import Any
 
 _GLOBAL_DEFAULTS: dict[str, Any] = {
     "tool_progress": "all",
-    "tool_progress_grouping": "accumulate",  # "accumulate" = edit one bubble; "separate" = one msg per tool
+    # "accumulate" = edit one bubble and retain prior lines;
+    # "replace" = edit one bubble with only the current tool kind;
+    # "separate" = one message per tool.
+    "tool_progress_grouping": "accumulate",
     "show_reasoning": False,
     # How a reasoning/thinking summary is rendered when show_reasoning is on.
     #   "code"      -> 💭 **Reasoning:** + fenced code block (legacy default)
@@ -299,7 +302,7 @@ def _normalise(setting: str, value: Any) -> Any:
         return val if val in {"full", "verb", "off"} else "full"
     if setting == "tool_progress_grouping":
         val = str(value).lower()
-        return val if val in ("accumulate", "separate") else "accumulate"
+        return val if val in ("accumulate", "replace", "separate") else "accumulate"
     if setting == "reasoning_style":
         val = str(value).lower()
         return val if val in ("code", "blockquote", "subtext") else "code"

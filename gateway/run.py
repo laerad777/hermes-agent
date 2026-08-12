@@ -4004,6 +4004,20 @@ class TurnRunner:
         from agent.display import get_tool_emoji
         emoji = get_tool_emoji(tool_name, default="⚙️")
 
+        # ``replace`` is the privacy-preserving compact mode: expose only the
+        # current tool kind, never its arguments, previews, commands, paths, or
+        # traceback-like text.  The progress sender edits the existing bubble
+        # in place when the next tool starts.
+        if ctx.progress_grouping == "replace":
+            msg = f"{emoji} {tool_name}"
+            ctx.last_was_terminal_block[0] = False
+            if msg == ctx.last_progress_msg[0]:
+                return
+            ctx.last_progress_msg[0] = msg
+            ctx.repeat_count[0] = 0
+            ctx.progress_queue.put(msg)
+            return
+
         # Markdown-capable platforms render a terminal command as a fenced
         # code block instead of the compact `terminal: "cmd…"` preview.
         # Gated on the adapter's ``supports_code_blocks`` capability so
@@ -4350,7 +4364,10 @@ class TurnRunner:
                     continue
                 else:
                     msg = raw
-                    progress_lines.append(msg)
+                    if ctx.progress_grouping == "replace":
+                        progress_lines[:] = [msg]
+                    else:
+                        progress_lines.append(msg)
 
                 if await _roll_progress_overflow_if_needed():
                     _last_edit_ts = time.monotonic()
