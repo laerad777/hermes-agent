@@ -13,7 +13,13 @@ import pytest
 
 import gateway.platforms.base as base_platform
 from gateway.config import Platform, PlatformConfig, StreamingConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    SendResult,
+    _GatewayDeliveryResponse,
+)
 from gateway.session import SessionSource
 
 
@@ -115,6 +121,31 @@ class MetadataEditProgressCaptureAdapter(ProgressCaptureAdapter):
             }
         )
         return SendResult(success=True, message_id=message_id)
+
+
+class OutboundMetadataEditProgressCaptureAdapter(MetadataEditProgressCaptureAdapter):
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(platform=platform)
+        self.retry_sends = []
+
+    async def _send_with_retry(
+        self,
+        chat_id,
+        content,
+        reply_to=None,
+        metadata=None,
+        max_retries=2,
+        base_delay=2.0,
+    ) -> SendResult:
+        self.retry_sends.append(
+            {
+                "chat_id": chat_id,
+                "content": content,
+                "reply_to": reply_to,
+                "metadata": metadata,
+            }
+        )
+        return SendResult(success=True, message_id="outbound-1")
 
 
 class FailedTransformedEditProgressCaptureAdapter(MetadataEditProgressCaptureAdapter):
@@ -910,6 +941,51 @@ class CanonicalPollStreamAgent:
         }
 
 
+class FiveToolCanonicalModalStreamAgent:
+    """Mirror a real tool-heavy turn before the canonical final carrier."""
+
+    def __init__(self, **kwargs):
+        self.stream_delta_callback = kwargs.get("stream_delta_callback")
+        self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        for index in range(5):
+            if self.stream_delta_callback:
+                self.stream_delta_callback(f"preview {index + 1}")
+            if self.interim_assistant_callback:
+                self.interim_assistant_callback(
+                    f"preview {index + 1}", already_streamed=True
+                )
+            if self.stream_delta_callback:
+                self.stream_delta_callback(None)
+            if self.tool_progress_callback:
+                self.tool_progress_callback(
+                    "tool.started", "web_search", f"query {index + 1}", {}
+                )
+                self.tool_progress_callback(
+                    "tool.completed", "web_search", f"result {index + 1}", {}
+                )
+        if self.stream_delta_callback:
+            self.stream_delta_callback("modal summary")
+        return {
+            "final_response": "modal summary\n" + _native_carrier(
+                "modal",
+                {
+                    "title": "Feedback",
+                    "trigger_label": "Open",
+                    "ttl_seconds": 60,
+                    "inputs": [
+                        {"id": "note", "label": "Note", "style": "paragraph"}
+                    ],
+                },
+            ),
+            "messages": [],
+            "api_calls": 6,
+        }
+
+
 @pytest.mark.asyncio
 async def test_transformed_response_edits_streamed_message_in_place(monkeypatch, tmp_path):
     """When a transform_llm_output hook modifies the response after streaming,
@@ -1001,6 +1077,73 @@ async def test_canonical_native_carrier_survives_run_agent_completion(
     assert result["delivery_metadata_response"] == expected_body
     assert result["delivery_metadata"]["discord_native_payload"].kind == expected_kind
     assert all("HERMES_DISCORD" not in str(call) for call in adapter.sent + adapter.edits)
+
+
+@pytest.mark.asyncio
+async def test_five_tool_turn_accepts_native_terminal_completion(
+    monkeypatch, tmp_path, caplog
+):
+    caplog.set_level("DEBUG", logger="gateway.run")
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        FiveToolCanonicalModalStreamAgent,
+        session_id="sess-five-tool-native-modal",
+        config_data={
+            "display": {"tool_progress": "off", "interim_assistant_messages": True},
+            "streaming": {
+                "enabled": True,
+                "edit_interval": 0.01,
+                "buffer_threshold": 1,
+            },
+        },
+        platform=Platform.DISCORD,
+        chat_id="1234",
+        chat_type="group",
+        thread_id="modal-thread",
+        adapter_cls=OutboundMetadataEditProgressCaptureAdapter,
+    )
+    assert isinstance(adapter, OutboundMetadataEditProgressCaptureAdapter)
+
+    assert result["final_response"] == "modal summary"
+    assert result["delivery_metadata"]["discord_native_payload"].kind == "modal"
+    assert any(
+        (edit.get("metadata") or {}).get("discord_native_payload") is not None
+        for edit in adapter.edits
+    )
+    assert "Discord stream terminal completion accepted=True" in caplog.text
+
+    carrier = _GatewayDeliveryResponse(
+        result["final_response"], delivery_metadata=result["delivery_metadata"]
+    )
+
+    async def _carrier_result(_event):
+        return carrier
+
+    adapter.set_message_handler(_carrier_result)
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="1234",
+        user_id="owner-1",
+        chat_type="group",
+        thread_id="modal-thread",
+    )
+    event = MessageEvent(
+        text="build native UI",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="inbound-5-tool",
+    )
+    session_key = "agent:main:discord:group:1234:modal-thread"
+    adapter._active_sessions[session_key] = asyncio.Event()
+    await adapter._process_message_background(event, session_key)
+
+    assert len(adapter.retry_sends) == 1
+    outbound = adapter.retry_sends[0]
+    assert outbound["metadata"]["discord_native_payload"]["kind"] == "modal"
+    assert outbound["metadata"]["_discord_delivery_obligation_id"] == (
+        "turn:inbound-5-tool"
+    )
 
 
 @pytest.mark.asyncio

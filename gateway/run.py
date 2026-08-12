@@ -25126,7 +25126,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     response.pop("delivery_metadata", None)
                     response.pop("delivery_metadata_response", None)
                 if source.platform == Platform.DISCORD:
-                    _sc_for_completion.complete(_completed_body, _completed_metadata)
+                    _completion_accepted = _sc_for_completion.complete(
+                        _completed_body, _completed_metadata
+                    )
+                    logger.debug(
+                        "Discord stream terminal completion accepted=%s session=%s metadata=%s",
+                        _completion_accepted,
+                        session_key or "?",
+                        sorted(_completed_metadata) if _completed_metadata else [],
+                    )
+                    if not _completion_accepted:
+                        logger.error(
+                            "Discord stream terminal completion was already claimed "
+                            "for session %s; authoritative delivery metadata will "
+                            "continue through ordinary final delivery.",
+                            session_key or "?",
+                        )
                 else:
                     # Preserve every existing platform's streaming cadence;
                     # only Discord needs an authoritative completed payload to
