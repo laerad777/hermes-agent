@@ -86,6 +86,16 @@ class DeliveryTransport:
                 content,
                 metadata=metadata,
             )
+        if (
+            logical_platform == Platform.DISCORD
+            and isinstance(metadata, dict)
+            and metadata.get("discord_native_payload") is not None
+        ):
+            return await self.adapter._send_with_retry(
+                chat_id=chat_id,
+                content=content,
+                metadata=metadata,
+            )
         return await self.adapter.send(chat_id, content, metadata=metadata)
 
 

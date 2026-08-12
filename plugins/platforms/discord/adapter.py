@@ -34,6 +34,12 @@ from urllib.parse import quote, urljoin
 from hermes_constants import get_hermes_home as _product_details_hermes_home
 from gateway.discord_product_details import validate_discord_product_details
 from plugins.platforms.discord.product_details import DiscordProductDetailStore
+from gateway.discord_native import validate_discord_native_payload
+from plugins.platforms.discord.native_interactions import (
+    DiscordNativeInteractionStore,
+    build_native_view,
+    native_route_allows,
+)
 
 from agent.async_utils import (
     consume_detached_task_result as _consume_background_task_result,
@@ -1048,12 +1054,19 @@ class DiscordAdapter(BasePlatformAdapter):
         self._allowed_user_ids: set = set()  # For button approval authorization
         self._allowed_role_ids: set = set()  # For DISCORD_ALLOWED_ROLES filtering
         self._product_details_store: DiscordProductDetailStore | None = None
+        self._native_interaction_store: DiscordNativeInteractionStore | None = None
         try:
             self._product_details_store = DiscordProductDetailStore(
                 _product_details_hermes_home() / "gateway" / "discord_product_details"
             )
         except Exception:
             logger.warning("Discord product details disabled: secure store unavailable", exc_info=True)
+        try:
+            self._native_interaction_store = DiscordNativeInteractionStore(
+                _product_details_hermes_home() / "gateway" / "discord_native_interactions"
+            )
+        except Exception:
+            logger.warning("Discord native interactions disabled: secure store unavailable", exc_info=True)
         # Per-adapter snapshot of authorization gate env vars, captured inside
         # the owning profile's runtime scope during connect(). None until then;
         # accessors fall back to live scope-aware reads (issue #72348).
@@ -1368,11 +1381,14 @@ class DiscordAdapter(BasePlatformAdapter):
             async def on_ready():
                 logger.info("[%s] Connected as %s", adapter_self.name, adapter_self._client.user)
 
-                if adapter_self._product_details_store is not None:
+                if (
+                    adapter_self._product_details_store is not None
+                    or adapter_self._native_interaction_store is not None
+                ):
                     client = adapter_self._client
                     if client is None:
                         return
-                    adapter_self._restore_product_details_views(client)
+                    adapter_self._restore_persistent_views(client)
 
                 # Resolve any usernames in the allowed list to numeric IDs
                 await adapter_self._resolve_allowed_usernames()
@@ -1820,6 +1836,10 @@ class DiscordAdapter(BasePlatformAdapter):
         self._product_details_store = None
         if product_details_store is not None:
             product_details_store.close()
+        native_interaction_store = self._native_interaction_store
+        self._native_interaction_store = None
+        if native_interaction_store is not None:
+            native_interaction_store.close()
         # Cancel the liveness probe first so it can't fire a spurious fatal
         # error / reconnect while we're intentionally tearing the adapter down.
         await self._cancel_liveness_task()
@@ -3074,6 +3094,27 @@ class DiscordAdapter(BasePlatformAdapter):
             return None
 
     async def _structured_delivery_begin(self, **kwargs):
+        raw_native = kwargs["metadata"].get("discord_native_payload")
+        if raw_native is not None:
+            native_mapping = raw_native if isinstance(raw_native, dict) else {}
+            kind = getattr(raw_native, "kind", None) or native_mapping.get("kind")
+            payload = getattr(raw_native, "payload", None) or native_mapping.get("payload")
+            owner = getattr(raw_native, "owner_user_id", None) or native_mapping.get("owner_user_id")
+            envelope = validate_discord_native_payload(kind, payload)
+            if kind == "poll" or self._native_interaction_store is None or not owner:
+                return None
+            thread_id = kwargs["metadata"].get("thread_id")
+            delivery = self._native_interaction_store.prepare_delivery(
+                logical_id=kwargs["logical_delivery_id"],
+                envelope=envelope,
+                owner_user_id=str(owner),
+                guild_id=(
+                    str(kwargs["metadata"]["discord_guild_id"])
+                    if kwargs["metadata"].get("discord_guild_id") is not None else None
+                ),
+                channel_id=str(thread_id or kwargs["chat_id"]),
+            )
+            return _DiscordStructuredDeliveryHandle(delivery, envelope)
         if self._product_details_store is None:
             return None
         envelope = validate_discord_product_details(
@@ -3093,22 +3134,35 @@ class DiscordAdapter(BasePlatformAdapter):
         )
         return _DiscordStructuredDeliveryHandle(delivery, envelope)
 
-    def _restore_product_details_views(self, client: Any) -> None:
+    def _restore_persistent_views(self, client: Any) -> None:
         store = self._product_details_store
-        if store is None:
-            return
-        store.maintain()
-        for delivery, envelope, message_id in store.restore_active_deliveries():
-            try:
-                client.add_view(
-                    ProductDetailsView(self, delivery, envelope),
-                    message_id=int(message_id),
-                )
-            except Exception:
-                logger.warning(
-                    "Discord product-details View restore failed",
-                    exc_info=True,
-                )
+        if store is not None:
+            store.maintain()
+            for delivery, envelope, message_id in store.restore_active_deliveries():
+                try:
+                    client.add_view(
+                        ProductDetailsView(self, delivery, envelope),
+                        message_id=int(message_id),
+                    )
+                except Exception:
+                    logger.warning(
+                        "Discord product-details View restore failed",
+                        exc_info=True,
+                    )
+        native_store = self._native_interaction_store
+        if native_store is not None:
+            native_store.maintain()
+            for delivery, envelope, message_id in native_store.restore_active_deliveries():
+                try:
+                    client.add_view(
+                        build_native_view(discord, self, delivery, envelope),
+                        message_id=int(message_id),
+                    )
+                except Exception:
+                    logger.warning("Discord native View restore failed", exc_info=True)
+
+    def _restore_product_details_views(self, client: Any) -> None:
+        self._restore_persistent_views(client)
 
     async def _structured_delivery_attempt(self, **kwargs):
         metadata = dict(kwargs["metadata"])
@@ -3117,6 +3171,13 @@ class DiscordAdapter(BasePlatformAdapter):
 
     async def _structured_delivery_finalize(self, **kwargs):
         handle = kwargs["handle"]
+        if getattr(getattr(handle, "envelope", None), "kind", None) in {
+            "modal", "string_select", "user_select", "role_select",
+            "channel_select", "mentionable_select",
+        }:
+            if self._native_interaction_store is not None and kwargs["outcome"] != "success":
+                self._native_interaction_store.discard_pending(handle.delivery)
+            return
         store = self._product_details_store
         if store is None or not isinstance(handle, _DiscordStructuredDeliveryHandle):
             return
@@ -3168,6 +3229,46 @@ class DiscordAdapter(BasePlatformAdapter):
             store.discard_delivery(delivery)
         except Exception:
             logger.warning("Discord product-details row cleanup failed", exc_info=True)
+        return False
+
+    async def _bind_native_delivery_or_cleanup(
+        self,
+        delivery: Any,
+        message_id: str,
+        message: Any,
+        *,
+        content: str | None = None,
+    ) -> bool:
+        """Bind a native View or remove both its posted View and durable row."""
+        store = self._native_interaction_store
+        if store is None:
+            try:
+                await message.edit(content=content, view=None)
+            except Exception:
+                logger.warning("Discord native View cleanup failed", exc_info=True)
+            return False
+        try:
+            bound = store.bind_delivery(delivery, message_id)
+        except Exception:
+            try:
+                await message.edit(content=content, view=None)
+            except Exception:
+                logger.warning("Discord native View cleanup failed", exc_info=True)
+            try:
+                store.discard_delivery(delivery)
+            except Exception:
+                logger.warning("Discord native row cleanup failed", exc_info=True)
+            raise
+        if bound:
+            return True
+        try:
+            await message.edit(content=content, view=None)
+        except Exception:
+            logger.warning("Discord native View cleanup failed", exc_info=True)
+        try:
+            store.discard_delivery(delivery)
+        except Exception:
+            logger.warning("Discord native row cleanup failed", exc_info=True)
         return False
 
     async def send(
@@ -3236,10 +3337,30 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Forum channels reject channel.send() — create a thread post instead.
             if self._is_forum_parent(channel):
+                raw_native = (metadata or {}).get("discord_native_payload")
+                native_kind = (
+                    getattr(raw_native, "kind", None)
+                    if not isinstance(raw_native, dict)
+                    else raw_native.get("kind")
+                )
+                if native_kind == "poll":
+                    return SendResult(
+                        success=False, error="poll route is not supported for forums",
+                        retryable=False, delivery_certainty="not_sent",
+                        structured_failure="poll_route_disallowed",
+                    )
                 result = await self._send_to_forum(channel, content)
                 structured_handle = (metadata or {}).get("_discord_structured_delivery_handle")
                 if isinstance(structured_handle, _DiscordStructuredDeliveryHandle):
-                    if self._product_details_store is not None:
+                    if getattr(structured_handle.envelope, "kind", None) in {
+                        "modal", "string_select", "user_select", "role_select",
+                        "channel_select", "mentionable_select",
+                    }:
+                        if self._native_interaction_store is not None:
+                            self._native_interaction_store.discard_pending(
+                                structured_handle.delivery
+                            )
+                    elif self._product_details_store is not None:
                         self._product_details_store.discard_pending(
                             structured_handle.delivery
                         )
@@ -3259,6 +3380,110 @@ class DiscordAdapter(BasePlatformAdapter):
 
             product_delivery = None
             product_view = None
+            native_delivery = None
+            native_view = None
+            raw_native = (metadata or {}).get("discord_native_payload")
+            native_kind: str | None = None
+            native_downgraded = False
+            if raw_native is not None:
+                native_mapping = raw_native if isinstance(raw_native, dict) else {}
+                native_kind = getattr(raw_native, "kind", None) or native_mapping.get("kind")
+                payload = getattr(raw_native, "payload", None) or native_mapping.get("payload")
+                owner = getattr(raw_native, "owner_user_id", None) or native_mapping.get("owner_user_id")
+                envelope = validate_discord_native_payload(native_kind, payload)
+                kind = envelope.kind
+                chat_type = "dm" if getattr(channel, "guild", None) is None else "guild_text"
+                route = str((metadata or {}).get("_discord_native_route") or "normal")
+                route_allowed = native_route_allows(
+                    kind,
+                    route=route,
+                    chat_type=chat_type,
+                    owner_user_id=owner,
+                )
+                if kind == "poll" and not route_allowed:
+                    return SendResult(
+                        success=False, error="poll route is not allowed",
+                        retryable=False, delivery_certainty="not_sent",
+                        structured_failure="poll_route_disallowed",
+                    )
+                if kind == "poll":
+                    poll_store = self._native_interaction_store
+                    logical_id = str(
+                        (metadata or {}).get("_discord_logical_delivery_id") or ""
+                    )
+                    obligation_hash = str(
+                        (metadata or {}).get("_discord_poll_obligation_hash") or ""
+                    )
+                    target_hash = str(
+                        (metadata or {}).get("_discord_poll_target_hash") or ""
+                    )
+                    payload_hash = str(
+                        (metadata or {}).get("_discord_poll_payload_hash") or ""
+                    )
+                    if (
+                        poll_store is None or not logical_id or not target_hash
+                        or not obligation_hash or not payload_hash
+                    ):
+                        return SendResult(
+                            success=False, error="poll delivery ledger unavailable",
+                            retryable=False, delivery_certainty="not_sent",
+                            structured_failure="poll_ledger_unavailable",
+                        )
+                    try:
+                        claimed = poll_store.claim_poll(
+                            logical_id, target_hash, obligation_hash, payload_hash,
+                        )
+                    except ValueError:
+                        return SendResult(
+                            success=False, error="poll obligation payload mismatch",
+                            retryable=False, delivery_certainty="not_sent",
+                            structured_failure="poll_identity_mismatch",
+                        )
+                    if not claimed:
+                        return SendResult(
+                            success=False, error="poll logical delivery already claimed",
+                            retryable=False, delivery_certainty="unknown",
+                            structured_failure="poll_already_claimed",
+                        )
+                    poll = discord.Poll(
+                        question=envelope.payload["question"],
+                        duration=dt.timedelta(hours=envelope.payload["duration_hours"]),
+                        multiple=envelope.payload["allow_multiselect"],
+                    )
+                    for answer in envelope.payload["answers"]:
+                        poll.add_answer(text=answer["text"])
+                    try:
+                        msg = await channel.send(
+                            content=self.format_message(content), poll=poll,
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                    except Exception as exc:
+                        poll_store.finish_poll(
+                            logical_id, "unknown", error_class=type(exc).__name__,
+                        )
+                        return SendResult(
+                            success=False, error=str(exc), retryable=False,
+                            delivery_certainty="unknown",
+                        )
+                    poll_store.finish_poll(
+                        logical_id, "sent", message_id=str(msg.id),
+                    )
+                    return SendResult(
+                        success=True, message_id=str(msg.id),
+                        raw_response={"message_ids": [str(msg.id)]},
+                        delivery_certainty="delivered",
+                    )
+                native_downgraded = not route_allowed
+                native_handle = (metadata or {}).get("_discord_structured_delivery_handle")
+                if (
+                    isinstance(native_handle, _DiscordStructuredDeliveryHandle)
+                    and getattr(native_handle.envelope, "kind", None) == kind
+                    and native_route_allows(
+                        kind, route="normal", chat_type=chat_type, owner_user_id=owner,
+                    )
+                ):
+                    native_delivery = native_handle.delivery
+                    native_view = build_native_view(discord, self, native_delivery, envelope)
             raw_details = (metadata or {}).get("discord_product_details")
             structured_handle = (metadata or {}).get("_discord_structured_delivery_handle")
             if raw_details and isinstance(
@@ -3289,6 +3514,9 @@ class DiscordAdapter(BasePlatformAdapter):
                     kwargs = {"content": chunk, "reference": chunk_reference}
                     if product_view is not None and i == len(chunks) - 1:
                         kwargs["view"] = product_view
+                    if native_view is not None and i == len(chunks) - 1:
+                        kwargs["view"] = native_view
+                    kwargs["allowed_mentions"] = discord.AllowedMentions.none()
                     msg = await channel.send(**kwargs)
                 except Exception as e:
                     if product_delivery is not None:
@@ -3334,6 +3562,15 @@ class DiscordAdapter(BasePlatformAdapter):
                             delivery_certainty="delivered",
                             structured_failure="bind_failed",
                         )
+                if native_delivery is not None and i == len(chunks) - 1:
+                    if not await self._bind_native_delivery_or_cleanup(
+                        native_delivery, str(msg.id), msg, content=chunk,
+                    ):
+                        return SendResult(
+                            success=True, message_id=str(msg.id),
+                            delivery_certainty="delivered",
+                            structured_failure="bind_failed",
+                        )
 
             # Track the last message we sent in this channel for history
             # backfill — avoids a full channel.history() scan on hot paths.
@@ -3349,6 +3586,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 message_id=message_ids[0] if message_ids else None,
                 raw_response={"message_ids": message_ids},
                 delivery_certainty="delivered" if structured_handle is not None else None,
+                structured_failure=(
+                    "native_component_downgraded"
+                    if native_downgraded
+                    else None
+                ),
             )
             await asyncio.to_thread(
                 self._record_discord_response,
@@ -3543,6 +3785,37 @@ class DiscordAdapter(BasePlatformAdapter):
             formatted = self.format_message(content)
             product_delivery = None
             product_view = None
+            native_delivery = None
+            native_view = None
+            raw_native = (metadata or {}).get("discord_native_payload") if finalize else None
+            if raw_native is not None:
+                native_mapping = raw_native if isinstance(raw_native, dict) else {}
+                kind = getattr(raw_native, "kind", None) or native_mapping.get("kind")
+                payload = getattr(raw_native, "payload", None) or native_mapping.get("payload")
+                owner = getattr(raw_native, "owner_user_id", None) or native_mapping.get("owner_user_id")
+                envelope = validate_discord_native_payload(kind, payload)
+                channel_kind = "dm" if getattr(channel, "guild", None) is None else "guild_text"
+                if (
+                    kind != "poll"
+                    and self._native_interaction_store is not None
+                    and native_route_allows(
+                        kind,
+                        route="stream_edit" if (metadata or {}).get("streaming") else "nonstream_edit",
+                        chat_type=channel_kind,
+                        owner_user_id=owner,
+                    )
+                ):
+                    native_delivery = self._native_interaction_store.prepare_delivery(
+                        logical_id=uuid.uuid4().hex,
+                        envelope=envelope,
+                        owner_user_id=owner,
+                        guild_id=(
+                            str((metadata or {})["discord_guild_id"])
+                            if (metadata or {}).get("discord_guild_id") is not None else None
+                        ),
+                        channel_id=str(chat_id),
+                    )
+                    native_view = build_native_view(discord, self, native_delivery, envelope)
             if finalize and metadata and metadata.get("discord_product_details"):
                 if self._product_details_store is not None:
                     try:
@@ -3584,6 +3857,8 @@ class DiscordAdapter(BasePlatformAdapter):
                         channel, msg, message_id, content,
                         product_delivery=product_delivery,
                         product_view=product_view,
+                        native_delivery=native_delivery,
+                        native_view=native_view,
                     )
                 formatted = self.truncate_message(
                     formatted, self.MAX_MESSAGE_LENGTH,
@@ -3606,6 +3881,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 edit_kwargs: Dict[str, Any] = {"content": formatted}
                 if product_view is not None:
                     edit_kwargs["view"] = product_view
+                if native_view is not None:
+                    edit_kwargs["view"] = native_view
+                    edit_kwargs["allowed_mentions"] = discord.AllowedMentions.none()
                 await msg.edit(**edit_kwargs)
                 if product_delivery is not None:
                     if not await self._bind_product_delivery_or_cleanup(
@@ -3619,6 +3897,15 @@ class DiscordAdapter(BasePlatformAdapter):
                         )
                 if _saturated_preview:
                     self._last_overflow_preview[_preview_key] = formatted
+                if native_delivery is not None:
+                    if not await self._bind_native_delivery_or_cleanup(
+                        native_delivery, str(message_id), msg, content=formatted,
+                    ):
+                        return SendResult(
+                            success=True, message_id=message_id,
+                            delivery_certainty="delivered",
+                            structured_failure="bind_failed",
+                        )
             except Exception as edit_err:
                 # Reactive split-and-deliver: format_message inflation (or a
                 # server-side rule change) can push the payload past 2,000
@@ -3630,6 +3917,8 @@ class DiscordAdapter(BasePlatformAdapter):
                             channel, msg, message_id, content,
                             product_delivery=product_delivery,
                             product_view=product_view,
+                            native_delivery=native_delivery,
+                            native_view=native_view,
                         )
                     # Mid-stream: truncate and retry in place (no split).
                     truncated = self.truncate_message(
@@ -3679,6 +3968,8 @@ class DiscordAdapter(BasePlatformAdapter):
         *,
         product_delivery: Any = None,
         product_view: Any = None,
+        native_delivery: Any = None,
+        native_view: Any = None,
     ) -> SendResult:
         """Deliver an oversized final edit across message + continuations.
 
@@ -3707,6 +3998,8 @@ class DiscordAdapter(BasePlatformAdapter):
             }
             if product_view is not None:
                 edit_kwargs["view"] = product_view
+            if native_view is not None:
+                edit_kwargs["view"] = native_view
             try:
                 await msg.edit(**edit_kwargs)
                 if product_delivery is not None:
@@ -3756,6 +4049,9 @@ class DiscordAdapter(BasePlatformAdapter):
             send_kwargs = {"content": chunk, "reference": reference}
             if product_view is not None and index == len(chunks) - 1:
                 send_kwargs["view"] = product_view
+            if native_view is not None and index == len(chunks) - 1:
+                send_kwargs["view"] = native_view
+                send_kwargs["allowed_mentions"] = discord.AllowedMentions.none()
             try:
                 sent = await channel.send(**send_kwargs)
             except Exception as send_err:
@@ -3798,6 +4094,19 @@ class DiscordAdapter(BasePlatformAdapter):
             last_id = continuation_ids[-1] if continuation_ids else message_id
             if not await self._bind_product_delivery_or_cleanup(
                 product_delivery, last_id, prev_msg, content=chunks[-1],
+            ):
+                return SendResult(
+                    success=True,
+                    message_id=last_id,
+                    continuation_message_ids=tuple(continuation_ids),
+                    delivery_certainty="delivered",
+                    structured_failure="bind_failed",
+                )
+
+        if native_delivery is not None:
+            last_id = continuation_ids[-1] if continuation_ids else message_id
+            if not await self._bind_native_delivery_or_cleanup(
+                native_delivery, last_id, prev_msg, content=chunks[-1],
             ):
                 return SendResult(
                     success=True,

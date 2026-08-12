@@ -1689,7 +1689,23 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     from tools.send_message_tool import _send_to_platform
     from gateway.config import load_gateway_config, Platform
 
-    # Optionally wrap the content with a header/footer so the user knows this
+    # Native markers are a transport trailer, not public prose. Parse and
+    # quarantine the raw agent response before adding any cron-owned wrapper so
+    # the trailer remains trailing and validated structured data is carried
+    # independently from the public text.
+    from types import SimpleNamespace
+    from gateway.run import _extract_discord_delivery_payload
+
+    cron_source = SimpleNamespace(
+        platform=SimpleNamespace(value="discord"),
+        user_id=str((_resolve_origin(job) or {}).get("user_id") or "") or None,
+    )
+    discord_public_content, discord_structured_metadata = (
+        _extract_discord_delivery_payload(cron_source, content)
+    )
+    public_content = discord_public_content
+
+    # Optionally wrap the public content with a header/footer so the user knows this
     # is a cron delivery.  Wrapping is on by default; set cron.wrap_response: false
     # in config.yaml for clean output.
     wrap_response = True
@@ -1707,11 +1723,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             f"Cronjob Response: {task_name}\n"
             f"(job_id: {job_id})\n"
             f"-------------\n\n"
-            f"{content}\n\n"
+            f"{public_content}\n\n"
             f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
         )
     else:
-        delivery_content = content
+        delivery_content = public_content
 
     # Extract MEDIA: tags so attachments are forwarded as files, not raw text
     from gateway.platforms.base import BasePlatformAdapter
@@ -1728,7 +1744,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         mirror_enabled = False
     mirror_text = ""
     if mirror_enabled:
-        _, mirror_text = BasePlatformAdapter.extract_media(content)
+        _, mirror_text = BasePlatformAdapter.extract_media(public_content)
         mirror_text = (mirror_text or "").strip()
 
     try:
@@ -1744,6 +1760,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         platform_name = target["platform"]
         chat_id = target["chat_id"]
         thread_id = target.get("thread_id")
+        structured_delivery_metadata = None
+        target_delivery_content = cleaned_delivery_content
+        if str(platform_name).lower() == "discord":
+            structured_delivery_metadata = discord_structured_metadata
 
         # Diagnostic: log thread_id for topic-aware delivery debugging
         origin = _resolve_origin(job) or {}
@@ -1970,6 +1990,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 route_metadata = {
                     "direct_messages_topic_id": str(thread_id),
                     "job_id": job["id"],
+                    "_discord_delivery_obligation_id": f"cron:{job['id']}:{job.get('execution_id', '')}",
                 }
                 # Media metadata mirrors the text routing so attachments land in
                 # the same DM topic instead of the General lane (#22773).
@@ -1984,10 +2005,17 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # anchor, so the metadata key bypasses that check and lets the
                 # adapter route via a plain message_thread_id.
                 route_thread_id = str(thread_id) if thread_id is not None else None
-                route_metadata = {"job_id": job["id"]}
+                route_metadata = {
+                    "job_id": job["id"],
+                    "_discord_delivery_obligation_id": f"cron:{job['id']}:{job.get('execution_id', '')}",
+                }
                 if route_thread_id:
                     route_metadata["thread_id"] = route_thread_id
                 media_metadata = {"thread_id": thread_id} if thread_id else None
+
+            if structured_delivery_metadata:
+                route_metadata.update(structured_delivery_metadata)
+                route_metadata["_discord_native_route"] = "cron_live"
 
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content.
@@ -1997,7 +2025,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # standalone cron path lacked this, so DM-topic cron deliveries
                 # landed in the General topic or were rejected by Bot API 10.0
                 # (#22773).
-                text_to_send = cleaned_delivery_content.strip()
+                text_to_send = target_delivery_content.strip()
                 adapter_ok = True
                 timed_out = False
                 if text_to_send:
@@ -2097,9 +2125,13 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             if isinstance(send_result, dict):
                                 send_success = bool(send_result.get("success", False))
                                 send_raw_response = send_result.get("raw_response")
+                                structured_failure = send_result.get("structured_failure")
                             else:
                                 send_success = _confirm_adapter_delivery(send_result)
                                 send_raw_response = getattr(send_result, "raw_response", None)
+                                structured_failure = getattr(
+                                    send_result, "structured_failure", None,
+                                )
 
                             if not send_success:
                                 if isinstance(send_result, dict):
@@ -2133,6 +2165,13 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                 msg = (
                                     f"configured thread_id {requested_thread_id} for "
                                     f"{platform_name}:{chat_id} was not found; delivered without thread_id"
+                                )
+                                logger.warning("Job '%s': %s", job["id"], msg)
+                                delivery_errors.append(msg)
+                            if structured_failure == "native_component_downgraded":
+                                msg = (
+                                    "Discord native component downgraded to public text for "
+                                    f"{platform_name}:{chat_id}"
                                 )
                                 logger.warning("Job '%s': %s", job["id"], msg)
                                 delivery_errors.append(msg)
@@ -2214,6 +2253,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     )
 
         if not delivered:
+            if structured_delivery_metadata:
+                target_errors.append(
+                    f"structured live cron delivery to {platform_name}:{chat_id} failed closed"
+                )
+                delivery_errors.extend(target_errors)
+                continue
             if transport is not None and transport.is_relay:
                 # Relay owns the logical destination and its connector owns the
                 # platform credential. A native retry could duplicate delivery
@@ -4619,6 +4664,7 @@ def run_one_job(
     execution_id = job.get("execution_id")
     if not execution_id:
         execution_id = create_execution(job["id"], source="direct")["id"]
+    job = dict(job, execution_id=execution_id)
     try:
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
         # one-shot's dispatch BEFORE its side effect runs, so a tick that dies

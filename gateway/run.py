@@ -721,6 +721,17 @@ def _extract_discord_delivery_payload(source: Any, response: str) -> tuple[str, 
     platform_name = str(getattr(platform, "value", platform) or "").lower()
     if platform_name != "discord":
         return response, None
+    from gateway.discord_native import extract_discord_native
+    native = extract_discord_native(response)
+    if native.payload is not None:
+        from dataclasses import replace
+
+        owner_user_id = str(getattr(source, "user_id", "") or "") or None
+        payload = native.payload
+        payload = replace(payload, owner_user_id=owner_user_id)
+        return native.public_text, {"discord_native_payload": payload}
+    if native.carrier != "legacy" and native.public_text != response:
+        return native.public_text, None
     from gateway.discord_product_details import extract_discord_product_details
     parsed = extract_discord_product_details(response)
     details = parsed.details
@@ -732,6 +743,41 @@ def _extract_discord_delivery_payload(source: Any, response: str) -> tuple[str, 
         {"discord_product_details": details}
         if details is not None else None
     )
+
+
+def _resolve_discord_delivery_payload(
+    source: Any,
+    response: str,
+    agent_result: dict,
+) -> tuple[str, dict | None]:
+    """Resolve structured Discord delivery data without losing stream state.
+
+    Streaming strips and validates the trailer before the ordinary fallback
+    send runs.  Preserve that validated metadata only while it remains bound
+    to the exact sanitized response.  A newly present trailer is authoritative
+    (including malformed/conflicting trailers, which explicitly clear prior
+    metadata), and changed plain text cannot inherit stale structured data.
+    """
+    parsed_response, parsed_metadata = _extract_discord_delivery_payload(
+        source, response
+    )
+    if parsed_response != response:
+        if parsed_metadata:
+            agent_result["delivery_metadata"] = parsed_metadata
+            agent_result["delivery_metadata_response"] = parsed_response
+        else:
+            agent_result.pop("delivery_metadata", None)
+            agent_result.pop("delivery_metadata_response", None)
+        return parsed_response, parsed_metadata
+
+    preserved_metadata = agent_result.get("delivery_metadata")
+    preserved_response = agent_result.get("delivery_metadata_response")
+    if preserved_metadata and preserved_response == response:
+        return response, preserved_metadata
+
+    agent_result.pop("delivery_metadata", None)
+    agent_result.pop("delivery_metadata_response", None)
+    return response, None
 
 
 def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
@@ -18382,9 +18428,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
 
             response = agent_result.get("final_response") or ""
-            response, _delivery_metadata = _extract_discord_delivery_payload(source, response)
-            if _delivery_metadata:
-                agent_result["delivery_metadata"] = _delivery_metadata
+            response, _delivery_metadata = _resolve_discord_delivery_payload(
+                source, response, agent_result
+            )
             # Hidden-reasoning-only retry exhaustion: the loop's sentinel text
             # ("Codex response remained incomplete after 3 continuation
             # attempts") doubles as final_response, so it would be delivered
@@ -25267,6 +25313,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             result["final_response"] = public
             if delivery_metadata:
                 result["delivery_metadata"] = delivery_metadata
+                result["delivery_metadata_response"] = public
             _stream_consumer.complete(public, delivery_metadata)
             if stream_task:
                 try:
@@ -26647,6 +26694,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 response["final_response"] = _completed_body
                 if _completed_metadata:
                     response["delivery_metadata"] = _completed_metadata
+                    response["delivery_metadata_response"] = _completed_body
+                else:
+                    response.pop("delivery_metadata", None)
+                    response.pop("delivery_metadata_response", None)
                 if source.platform == Platform.DISCORD:
                     _sc_for_completion.complete(_completed_body, _completed_metadata)
                 else:
@@ -27130,6 +27181,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _reconcile_metadata = _merge_gateway_delivery_metadata(
                     _reconcile_metadata, _delivery_metadata,
                 )
+            _native_delivery = (
+                _reconcile_metadata.get("discord_native_payload")
+                if isinstance(_reconcile_metadata, dict)
+                else None
+            )
+            _completed_poll = (
+                (_native_delivery.get("kind") if isinstance(_native_delivery, dict)
+                 else getattr(_native_delivery, "kind", None))
+                == "poll"
+            )
             if not _is_empty_sentinel and not _transformed and (_streamed or _content_delivered):
                 logger.info(
                     "Suppressing normal final send for session %s: final delivery already confirmed (streamed=%s previewed=%s content_delivered=%s).",
@@ -27139,7 +27200,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _content_delivered,
                 )
                 response["already_sent"] = True
-            elif not _is_empty_sentinel and not _transformed and _stale_finalized and _sc is not None:
+            elif (
+                not _is_empty_sentinel
+                and not _completed_poll
+                and not _transformed
+                and _stale_finalized
+                and _sc is not None
+            ):
                 # Stale finalize (#71643): the streamed message holds only the
                 # last preview snapshot. Prefer editing it up to the complete
                 # response (same shape as the transformed branch below) so the
@@ -27168,7 +27235,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             finalize=True,
                             metadata=_reconcile_metadata or None,
                         )
-                        if getattr(_reconcile_res, "success", True):
+                        if getattr(_reconcile_res, "success", False):
                             response["already_sent"] = True
                             logger.info(
                                 "Reconciled stale streamed finalize for session %s: edited message %s with the complete response (#71643).",
@@ -27190,24 +27257,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "Stale streamed finalize detected for session %s with no editable message; delivering complete response via normal final send (#71643).",
                         session_key or "?",
                     )
-            elif not _is_empty_sentinel and _transformed and _sc is not None:
+            elif (
+                not _is_empty_sentinel
+                and not _completed_poll
+                and _transformed
+                and _sc is not None
+            ):
                 # Plugin hooks transformed the response after streaming — edit the
                 # existing streamed message instead of sending a duplicate.
                 _sc_msg_id = _sc.message_id
                 if _sc_msg_id:
                     try:
-                        await _sc.adapter.edit_message(
+                        _reconcile_res = await _sc.adapter.edit_message(
                             chat_id=source.chat_id,
                             message_id=_sc_msg_id,
                             content=response["final_response"],
                             finalize=True,
                             metadata=_reconcile_metadata or None,
                         )
-                        response["already_sent"] = True
-                        logger.info(
-                            "Edited streamed message %s for session %s to include plugin-transformed content.",
-                            _sc_msg_id, session_key or "?",
-                        )
+                        if getattr(_reconcile_res, "success", False):
+                            response["already_sent"] = True
+                            logger.info(
+                                "Edited streamed message %s for session %s to include plugin-transformed content.",
+                                _sc_msg_id, session_key or "?",
+                            )
+                        else:
+                            logger.warning(
+                                "Transformed-response reconciliation edit failed for session %s (%s); sending complete response via normal final send.",
+                                session_key or "?",
+                                getattr(_reconcile_res, "error", None),
+                            )
                     except Exception as _edit_err:
                         logger.warning(
                             "Failed to edit streamed message for session %s: %s",

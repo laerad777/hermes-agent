@@ -1,7 +1,9 @@
 """Tests for topic-aware gateway progress updates."""
 
 import asyncio
+import base64
 import importlib
+import json
 import sys
 import time
 import types
@@ -1049,6 +1051,39 @@ class TransformedStreamAgent:
         }
 
 
+class TransformedPollStreamAgent:
+    def __init__(self, **kwargs):
+        self.stream_delta_callback = kwargs.get("stream_delta_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        if self.stream_delta_callback:
+            self.stream_delta_callback("old streamed poll body")
+        raw = json.dumps(
+            {
+                "kind": "poll",
+                "payload": {
+                    "question": "Ship?",
+                    "answers": [{"text": "Yes"}, {"text": "No"}],
+                    "duration_hours": 24,
+                },
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        marker = base64.urlsafe_b64encode(raw).decode().rstrip("=")
+        return {
+            "final_response": (
+                "authoritative poll summary\n"
+                f"<!--HERMES_DISCORD_NATIVE:v1:{marker}-->"
+            ),
+            "response_previewed": True,
+            "response_transformed": True,
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 @pytest.mark.asyncio
 async def test_transformed_response_edits_streamed_message_in_place(monkeypatch, tmp_path):
     """When a transform_llm_output hook modifies the response after streaming,
@@ -1768,3 +1803,31 @@ class TestSlackReplyInThreadProgressRouting:
             event_message_id="1700000000.000100",
             reply_in_thread=False,
         ) is None
+
+
+@pytest.mark.asyncio
+async def test_transformed_streamed_poll_skips_all_reconciliation_edits(
+    monkeypatch, tmp_path
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        TransformedPollStreamAgent,
+        session_id="sess-transformed-stream-poll",
+        config_data={
+            "display": {"tool_progress": "off", "interim_assistant_messages": False},
+            "streaming": {"enabled": True, "edit_interval": 0.01, "buffer_threshold": 1},
+        },
+        platform=Platform.DISCORD,
+        chat_id="1234",
+        chat_type="group",
+        thread_id="poll-thread",
+        adapter_cls=MetadataEditProgressCaptureAdapter,
+    )
+
+    assert result["final_response"] == "authoritative poll summary"
+    assert result.get("already_sent") is not True
+    assert result["delivery_metadata"]["discord_native_payload"].kind == "poll"
+    assert [edit["content"] for edit in adapter.edits] == ["…"]
+    assert all("HERMES_DISCORD" not in str(call) for call in adapter.sent + adapter.edits)
+
