@@ -1832,11 +1832,11 @@ class DiscordAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         """Disconnect from Discord."""
         self._disconnecting = True
-        product_details_store = self._product_details_store
+        product_details_store = getattr(self, "_product_details_store", None)
         self._product_details_store = None
         if product_details_store is not None:
             product_details_store.close()
-        native_interaction_store = self._native_interaction_store
+        native_interaction_store = getattr(self, "_native_interaction_store", None)
         self._native_interaction_store = None
         if native_interaction_store is not None:
             native_interaction_store.close()

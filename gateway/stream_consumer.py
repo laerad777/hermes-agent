@@ -206,6 +206,10 @@ class GatewayStreamConsumer:
         self.chat_id = chat_id
         self.cfg = config or StreamConsumerConfig()
         self.metadata = metadata
+        # Set by gateway.run when this consumer carries real assistant deltas.
+        # Interim/status-only consumers still use the same queue but must not
+        # render a completed final answer as another status message.
+        self.stream_deltas_enabled = False
         # Fired whenever a fresh content bubble is created on the platform
         # (first-send of a new message, commentary, overflow chunk, or
         # fallback continuation). The gateway uses this to linearize the

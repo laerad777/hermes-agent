@@ -5722,7 +5722,9 @@ class BasePlatformAdapter(ABC):
 
         if result.success:
             await finalize(
-                "bind_failed" if result.structured_failure == "bind_failed" else "success",
+                "bind_failed"
+                if getattr(result, "structured_failure", None) == "bind_failed"
+                else "success",
                 result,
             )
             return result

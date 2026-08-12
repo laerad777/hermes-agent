@@ -4797,6 +4797,11 @@ class TurnRunner:
                                 # Tee to the streaming-TTS consumer (#60671).
                                 if _stts_consumer_ref is not None:
                                     _stts_consumer_ref.on_delta(text)
+                    # Completion payloads are user-facing final deliveries only
+                    # for real text streaming. An interim-only consumer must
+                    # receive the terminal sentinel without rendering the final
+                    # answer as another progress/status message.
+                    _stream_consumer.stream_deltas_enabled = bool(_want_stream_deltas)
                     ctx.stream_consumer_holder[0] = _stream_consumer
             except Exception as _sc_err:
                 logger.debug("Could not set up stream consumer: %s", _sc_err)
@@ -26715,12 +26720,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else:
                     response.pop("delivery_metadata", None)
                     response.pop("delivery_metadata_response", None)
-                if source.platform == Platform.DISCORD:
+                if (
+                    source.platform == Platform.DISCORD
+                    and _sc_for_completion.stream_deltas_enabled
+                ):
                     _sc_for_completion.complete(_completed_body, _completed_metadata)
                 else:
-                    # Preserve every existing platform's streaming cadence;
-                    # only Discord needs an authoritative completed payload to
-                    # carry the quarantined private trailer metadata.
+                    # Preserve every existing platform's streaming cadence and
+                    # keep interim-only Discord consumers non-conversational.
                     _sc_for_completion.finish()
 
             # Finalize the streaming-TTS consumer (#60671).

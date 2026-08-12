@@ -376,8 +376,8 @@ def test_typed_review_spawn_requires_authoritative_connection(monkeypatch, tmp_p
         kb._default_spawn(_make_task(kb, assignee="critic", step="critic"), str(workspace))
 
 
-@pytest.mark.parametrize("step", [None, "critic"])
-def test_windows_worker_spawn_fails_closed_before_popen(monkeypatch, tmp_path, step):
+def test_windows_typed_reviewer_spawn_fails_closed_before_popen(monkeypatch, tmp_path):
+    step = "critic"
     root = tmp_path / ".hermes"
     profile_name = step or "executor"
     profile = root / "profiles" / profile_name

@@ -197,7 +197,6 @@ def _kill_process_group(proc: subprocess.Popen, pgid: Optional[int] = None) -> N
 def _run_bounded(argv: list[str], *, cwd: Path, timeout: int) -> tuple[int, str]:
     kwargs = {
         "cwd": str(cwd),
-        "stdin": subprocess.DEVNULL,
         "stdout": subprocess.PIPE,
         "stderr": subprocess.STDOUT,
         "env": _review_env(),
@@ -206,7 +205,7 @@ def _run_bounded(argv: list[str], *, cwd: Path, timeout: int) -> tuple[int, str]
         kwargs["start_new_session"] = True
     elif os.name == "nt":
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-    proc = subprocess.Popen(argv, **kwargs)
+    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, **kwargs)
     pgid = proc.pid if os.name == "posix" else None
     if proc.stdout is None:  # defensive fallback and test-double support
         return proc.wait(timeout=timeout), ""

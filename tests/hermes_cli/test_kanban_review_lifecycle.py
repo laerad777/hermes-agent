@@ -487,6 +487,22 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
         "load_config",
         lambda *args, **kwargs: {"kanban": {"review_dispatch": True}},
     )
+    reviewer_profile = kanban_home / "profiles" / "reviewer"
+    reviewer_profile.mkdir(parents=True)
+    (reviewer_profile / "config.yaml").write_text("{}\n", encoding="utf-8")
+    domain_skill = reviewer_profile / "skills" / "domain-specific-review"
+    domain_skill.mkdir(parents=True)
+    (domain_skill / "SKILL.md").write_text(
+        "---\nname: domain-specific-review\n"
+        "description: Review this domain.\n---\n# Domain review\n",
+        encoding="utf-8",
+    )
+    bundled_review_skill = reviewer_profile / "skills" / "sdlc-review"
+    bundled_review_skill.mkdir(parents=True)
+    (bundled_review_skill / "SKILL.md").write_text(
+        "---\nname: sdlc-review\ndescription: Review changes.\n---\n# Review\n",
+        encoding="utf-8",
+    )
     captured: list[list[str]] = []
 
     def spawn(task, workspace):
