@@ -84,6 +84,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import unicodedata
 import logging
 import time
 from contextvars import ContextVar, Token
@@ -995,6 +996,7 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    subject_version: int = 0
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1089,6 +1091,11 @@ class Task:
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
             ),
+            subject_version=(
+                int(row["subject_version"])
+                if "subject_version" in keys and row["subject_version"] is not None
+                else 0
+            ),
         )
 
 
@@ -1153,6 +1160,7 @@ class Comment:
     author: str
     body: str
     created_at: int
+    run_id: Optional[int] = None
 
 
 @dataclass
@@ -1276,7 +1284,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    subject_version      INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1290,7 +1299,28 @@ CREATE TABLE IF NOT EXISTS task_comments (
     task_id    TEXT NOT NULL,
     author     TEXT NOT NULL,
     body       TEXT NOT NULL,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    run_id     INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS review_run_authority (
+    run_id INTEGER PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    reviewer_profile TEXT NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('architect', 'critic')),
+    authority_mode TEXT NOT NULL CHECK(authority_mode = 'trusted_workspace_snapshot_v1'),
+    threat_model TEXT NOT NULL CHECK(threat_model = 'trusted workspace snapshot; no concurrent hostile filesystem mutation'),
+    subject_kind TEXT NOT NULL CHECK(subject_kind IN ('task_snapshot_v1', 'git_workspace_head_v1')),
+    subject_version INTEGER NOT NULL,
+    subject_json TEXT NOT NULL,
+    subject_digest TEXT NOT NULL,
+    inspected_revision TEXT NOT NULL,
+    git_snapshot_digest TEXT,
+    workspace_realpath TEXT, workspace_dev INTEGER, workspace_ino INTEGER,
+    git_dir_realpath TEXT, git_dir_dev INTEGER, git_dir_ino INTEGER,
+    common_dir_realpath TEXT, common_dir_dev INTEGER, common_dir_ino INTEGER,
+    created_at INTEGER NOT NULL,
+    UNIQUE(task_id, run_id)
 );
 
 CREATE TABLE IF NOT EXISTS task_events (
@@ -1371,6 +1401,7 @@ CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_review_authority_task ON review_run_authority(task_id, run_id);
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
@@ -2475,6 +2506,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences",
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
+    if "subject_version" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "subject_version",
+            "subject_version INTEGER NOT NULL DEFAULT 0",
+        )
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
@@ -2490,6 +2526,52 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
     )
+
+    comments_exist = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_comments'"
+    ).fetchone() is not None
+    if comments_exist:
+        comment_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(task_comments)")
+        }
+        if "run_id" not in comment_cols:
+            _add_column_if_missing(conn, "task_comments", "run_id", "run_id INTEGER")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_comments_task_run "
+            "ON task_comments(task_id, run_id, id)"
+        )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS review_run_authority (
+            run_id INTEGER PRIMARY KEY, task_id TEXT NOT NULL,
+            reviewer_profile TEXT NOT NULL,
+            role TEXT NOT NULL CHECK(role IN ('architect', 'critic')),
+            authority_mode TEXT NOT NULL CHECK(authority_mode = 'trusted_workspace_snapshot_v1'),
+            threat_model TEXT NOT NULL CHECK(threat_model = 'trusted workspace snapshot; no concurrent hostile filesystem mutation'),
+            subject_kind TEXT NOT NULL CHECK(subject_kind IN ('task_snapshot_v1', 'git_workspace_head_v1')),
+            subject_version INTEGER NOT NULL, subject_json TEXT NOT NULL,
+            subject_digest TEXT NOT NULL, inspected_revision TEXT NOT NULL,
+            git_snapshot_digest TEXT,
+            workspace_realpath TEXT, workspace_dev INTEGER, workspace_ino INTEGER,
+            git_dir_realpath TEXT, git_dir_dev INTEGER, git_dir_ino INTEGER,
+            common_dir_realpath TEXT, common_dir_dev INTEGER, common_dir_ino INTEGER,
+            created_at INTEGER NOT NULL, UNIQUE(task_id, run_id)
+        )
+        """
+    )
+    authority_cols = {
+        row["name"] for row in conn.execute("PRAGMA table_info(review_run_authority)")
+    }
+    if "git_snapshot_digest" not in authority_cols:
+        _add_column_if_missing(
+            conn, "review_run_authority", "git_snapshot_digest",
+            "git_snapshot_digest TEXT",
+        )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_review_authority_task "
+        "ON review_run_authority(task_id, run_id)"
+    )
+    conn.execute("DROP TRIGGER IF EXISTS trg_review_subject_immutable")
 
     # task_events gained a run_id column; back-fill it as NULL for
     # historical events (they predate runs and can't be attributed).
@@ -2596,6 +2678,25 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         )
 
     _rebuild_drifted_tables(conn)
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_review_subject_immutable
+        BEFORE UPDATE OF title, body, assignee, current_step_key ON tasks
+        WHEN EXISTS (
+            SELECT 1 FROM review_run_authority a
+            JOIN task_runs r ON r.id = a.run_id
+            WHERE a.task_id = OLD.id AND r.ended_at IS NULL
+              AND OLD.current_run_id = a.run_id
+        ) AND (
+            NEW.title IS NOT OLD.title OR NEW.body IS NOT OLD.body OR
+            NEW.assignee IS NOT OLD.assignee OR
+            NEW.current_step_key IS NOT OLD.current_step_key
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'active review subject is immutable');
+        END
+        """
+    )
 
 
 # Legacy DBs defined these tables with a ``TEXT PRIMARY KEY`` id (or, for
@@ -2626,8 +2727,11 @@ _REBUILD_SPECS = {
         "CREATE TABLE task_comments ("
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " task_id TEXT NOT NULL, author TEXT NOT NULL, body TEXT NOT NULL,"
-        " created_at INTEGER NOT NULL)",
-        ("CREATE INDEX idx_comments_task ON task_comments(task_id, created_at)",),
+        " created_at INTEGER NOT NULL, run_id INTEGER)",
+        (
+            "CREATE INDEX idx_comments_task ON task_comments(task_id, created_at)",
+            "CREATE INDEX idx_comments_task_run ON task_comments(task_id, run_id, id)",
+        ),
     ),
     "task_runs": (
         "CREATE TABLE task_runs ("
@@ -2942,6 +3046,8 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    workflow_template_id: Optional[str] = None,
+    current_step_key: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3256,8 +3362,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id,
+                        workflow_template_id, current_step_key
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3283,6 +3390,8 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        workflow_template_id,
+                        current_step_key,
                     ),
                 )
                 for pid in parents:
@@ -3307,6 +3416,8 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "workflow_template_id": workflow_template_id,
+                        "current_step_key": current_step_key,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -3376,6 +3487,805 @@ def _inherit_notify_subs(
 def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
     row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
     return Task.from_row(row) if row else None
+
+
+class ReviewAuthorityError(RuntimeError):
+    """Strict review authority could not be bound or revalidated."""
+
+
+_REVIEW_AUTHORITY_MODE = "trusted_workspace_snapshot_v1"
+_REVIEW_THREAT_MODEL = (
+    "trusted workspace snapshot; no concurrent hostile filesystem mutation"
+)
+_REVIEW_GIT_SNAPSHOT_MAX_ITEMS = 100_000
+_REVIEW_GIT_SNAPSHOT_MAX_BYTES = 512 * 1024 * 1024
+_REVIEW_GIT_SNAPSHOT_MAX_SECONDS = 15.0
+_REVIEW_GIT_METADATA_MAX_BYTES = 16 * 1024 * 1024
+
+
+def _review_subject(conn: sqlite3.Connection, task: Task) -> tuple[str, str]:
+    parents = parent_ids(conn, task.id)
+    completed_parent_runs: list[dict[str, int]] = []
+    for parent_id in parents:
+        row = conn.execute(
+            "SELECT current_run_id, status FROM tasks WHERE id = ?", (parent_id,)
+        ).fetchone()
+        if row and row["status"] == "done" and row["current_run_id"] is not None:
+            completed_parent_runs.append(
+                {"task_id": parent_id, "run_id": int(row["current_run_id"])}
+            )
+    payload = {
+        "id": task.id,
+        "title": task.title,
+        "body": task.body or "",
+        "role": (task.current_step_key or task.assignee or "").strip().lower(),
+        "workflow_template_id": task.workflow_template_id,
+        "legacy_marker": _JEROME_WORKFLOW_MARKER in (task.body or ""),
+        "assignee": task.assignee,
+        "subject_version": task.subject_version,
+        "parent_ids": parents,
+        "completed_parent_runs": completed_parent_runs,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return raw, hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _bounded_git_text(path: Path) -> str:
+    data = path.read_bytes()
+    if len(data) > 4096:
+        raise ReviewAuthorityError("malformed Git administrative file")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ReviewAuthorityError("malformed Git administrative file") from exc
+    if any(unicodedata.category(ch).startswith("C") for ch in text.rstrip("\r\n")):
+        raise ReviewAuthorityError("malformed Git administrative file")
+    return text
+
+
+def _git_dir_from_file(dotgit: Path) -> Path:
+    text = _bounded_git_text(dotgit)
+    if not text.startswith("gitdir:"):
+        raise ReviewAuthorityError("malformed Git workspace .git file")
+    raw = text.split(":", 1)[1].strip()
+    if not raw:
+        raise ReviewAuthorityError("malformed Git workspace .git file")
+    target = Path(raw)
+    if not target.is_absolute():
+        target = dotgit.parent / target
+    try:
+        return target.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ReviewAuthorityError("malformed Git workspace .git file") from exc
+
+
+def _linked_worktree_common_dir(git_dir: Path, dotgit: Path) -> Optional[Path]:
+    common_record = git_dir / "commondir"
+    backlink = git_dir / "gitdir"
+    if not common_record.exists() and not backlink.exists():
+        return None
+    if not common_record.is_file() or not backlink.is_file():
+        raise ReviewAuthorityError("incomplete linked worktree administrative layout")
+    common_raw = _bounded_git_text(common_record).strip()
+    if not common_raw:
+        raise ReviewAuthorityError("linked worktree has empty commondir")
+    common_dir = (git_dir / common_raw).resolve(strict=True)
+    back_path = Path(_bounded_git_text(backlink).strip())
+    if back_path.resolve(strict=True) != dotgit.resolve(strict=True):
+        raise ReviewAuthorityError("linked worktree backlink mismatch")
+    if git_dir.parent.parent.resolve(strict=True) != common_dir:
+        raise ReviewAuthorityError("linked worktree common-dir relationship mismatch")
+    return common_dir
+
+
+def _submodule_superproject_workspace(git_dir: Path) -> Optional[tuple[Path, tuple[str, ...]]]:
+    current = git_dir
+    while current.parent != current:
+        if current.name == "modules":
+            relative = git_dir.relative_to(current)
+            groups: list[str] = []
+            pending: list[str] = []
+            for part in relative.parts:
+                if part == "modules":
+                    if not pending:
+                        return None
+                    groups.append(str(Path(*pending)))
+                    pending = []
+                else:
+                    pending.append(part)
+            if pending:
+                groups.append(str(Path(*pending)))
+            if not groups:
+                return None
+            super_admin = current.parent
+            if super_admin.name == ".git" and super_admin.is_dir():
+                return super_admin.parent.resolve(strict=True), tuple(groups)
+            backlink = super_admin / "gitdir"
+            if backlink.is_file() and (super_admin / "commondir").is_file():
+                dotgit = Path(_bounded_git_text(backlink).strip()).resolve(strict=True)
+                _linked_worktree_common_dir(super_admin, dotgit)
+                return dotgit.parent.resolve(strict=True), tuple(groups)
+        current = current.parent
+    return None
+
+
+def _parse_gitlink_index_oid(output: bytes, expected_path: bytes, oid_length: int) -> bytes:
+    records = output.split(b"\0")
+    if not records or records[-1] != b"":
+        raise ReviewAuthorityError("workspace is not a registered submodule with a unique stage-0 gitlink record")
+    records.pop()
+    stage_zero: list[bytes] = []
+    for record in records:
+        metadata, separator, record_path = record.partition(b"\t")
+        fields = metadata.split(b" ")
+        if not separator or len(fields) != 3:
+            raise ReviewAuthorityError("workspace has a malformed gitlink index record")
+        mode, oid, stage = fields
+        if record_path != expected_path or mode != b"160000" or stage != b"0":
+            raise ReviewAuthorityError("workspace is not a registered submodule with a unique stage-0 gitlink record")
+        if len(oid) != oid_length or re.fullmatch(rb"[0-9a-fA-F]+", oid) is None:
+            raise ReviewAuthorityError("submodule gitlink has an invalid object id")
+        stage_zero.append(oid.lower())
+    if len(stage_zero) != 1:
+        raise ReviewAuthorityError("workspace is not a registered submodule with a unique stage-0 gitlink record")
+    return stage_zero[0]
+
+
+def _trusted_gitmodules_blob(
+    parent_git_dir: Path, parent_workspace: Path, env: dict[str, str]
+) -> bytes:
+    """Return committed .gitmodules bytes only when index and worktree agree."""
+
+    def run(*arguments: str) -> subprocess.CompletedProcess[bytes]:
+        try:
+            return subprocess.run(
+                [
+                    "git", "--no-optional-locks", "-c", "core.fsmonitor=false",
+                    "-c", "core.untrackedCache=false", "-c", f"core.hooksPath={os.devnull}",
+                    f"--git-dir={parent_git_dir}", f"--work-tree={parent_workspace}",
+                    *arguments,
+                ],
+                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=_REVIEW_GIT_SNAPSHOT_MAX_SECONDS, check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ReviewAuthorityError("registered submodule verification failed") from exc
+
+    object_format = run("rev-parse", "--show-object-format")
+    format_name = object_format.stdout.strip().lower()
+    oid_length = 40 if format_name == b"sha1" else 64 if format_name == b"sha256" else 0
+    if object_format.returncode != 0 or oid_length == 0:
+        raise ReviewAuthorityError("workspace is not a registered submodule")
+
+    head = run("ls-tree", "-z", "HEAD", "--", ".gitmodules")
+    index = run("ls-files", "--stage", "-z", "--", ".gitmodules")
+    expected_path = b".gitmodules"
+    head_records = head.stdout.split(b"\0")
+    index_records = index.stdout.split(b"\0")
+    if (
+        head.returncode != 0 or index.returncode != 0
+        or len(head.stdout) > 4096 or len(index.stdout) > 4096
+        or not head_records or head_records[-1] != b""
+        or not index_records or index_records[-1] != b""
+    ):
+        raise ReviewAuthorityError("workspace is not a registered submodule")
+    head_records.pop()
+    index_records.pop()
+    if len(head_records) != 1 or len(index_records) != 1:
+        raise ReviewAuthorityError("workspace is not a registered submodule")
+
+    head_meta, head_sep, head_path = head_records[0].partition(b"\t")
+    index_meta, index_sep, index_path = index_records[0].partition(b"\t")
+    head_fields = head_meta.split(b" ")
+    index_fields = index_meta.split(b" ")
+    if (
+        not head_sep or not index_sep
+        or head_path != expected_path or index_path != expected_path
+        or len(head_fields) != 3 or len(index_fields) != 3
+        or head_fields[0] not in {b"100644", b"100755"}
+        or index_fields[0] not in {b"100644", b"100755"}
+        or index_fields[2] != b"0"
+    ):
+        raise ReviewAuthorityError("workspace is not a registered submodule")
+    head_oid = head_fields[2].lower()
+    index_oid = index_fields[1].lower()
+    if (
+        len(head_oid) != oid_length or len(index_oid) != oid_length
+        or re.fullmatch(rb"[0-9a-f]+", head_oid) is None
+        or re.fullmatch(rb"[0-9a-f]+", index_oid) is None
+        or head_oid != index_oid
+    ):
+        raise ReviewAuthorityError("workspace is not a registered submodule")
+
+    gitmodules = parent_workspace / ".gitmodules"
+    try:
+        worktree_stat = gitmodules.lstat()
+        worktree_bytes = gitmodules.read_bytes()
+    except OSError as exc:
+        raise ReviewAuthorityError("workspace is not a registered submodule") from exc
+    index_executable = index_fields[0] == b"100755"
+    worktree_executable = bool(worktree_stat.st_mode & 0o111)
+    if (
+        not gitmodules.is_file()
+        or gitmodules.is_symlink()
+        or worktree_executable != index_executable
+    ):
+        raise ReviewAuthorityError("workspace is not a registered submodule")
+
+    blob = run("cat-file", "blob", os.fsdecode(head_oid))
+    if (
+        blob.returncode != 0
+        or len(blob.stdout) > _REVIEW_GIT_METADATA_MAX_BYTES
+        or blob.stdout != worktree_bytes
+        or worktree_stat.st_size != len(worktree_bytes)
+    ):
+        raise ReviewAuthorityError("workspace is not a registered submodule")
+    return blob.stdout
+
+
+def _trusted_submodule_common_dir(workspace: Path, git_dir: Path) -> Path:
+    relationship = _submodule_superproject_workspace(git_dir)
+    if relationship is None:
+        raise ReviewAuthorityError("untrusted Git workspace .git file target")
+    super_workspace, relative_paths = relationship
+    env = {
+        "PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", ""),
+        "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8",
+        "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0",
+    }
+    base = [
+        "git", "--no-optional-locks", "-c", "core.fsmonitor=false",
+        "-c", "core.untrackedCache=false", "-c", f"core.hooksPath={os.devnull}",
+        f"--git-dir={git_dir}", f"--work-tree={workspace}",
+    ]
+
+    # A path under ``.git/modules`` is only an administrative convention: an
+    # unrelated repository can be cloned there with ``--separate-git-dir``.
+    # Bind every path component to the corresponding stage-0 gitlink in its
+    # immediate superproject index.  Walking one index at a time is required
+    # for nested submodules because a superproject index never contains its
+    # descendants' gitlinks.
+    root_layout = _trusted_git_layout(super_workspace)
+    if root_layout is None:
+        raise ReviewAuthorityError("Git submodule superproject is not a repository")
+    parent_workspace = super_workspace
+    parent_git_dir, _root_common_dir = root_layout
+    for depth, logical_name in enumerate(relative_paths):
+        gitmodules_bytes = _trusted_gitmodules_blob(parent_git_dir, parent_workspace, env)
+        parser_input: Optional[Path] = None
+        try:
+            with tempfile.NamedTemporaryFile(prefix="hermes-gitmodules-", delete=False) as temp:
+                temp.write(gitmodules_bytes)
+                parser_input = Path(temp.name)
+            mapping = subprocess.run(
+                [
+                    "git", "--no-optional-locks", "config", "--no-includes", "--null",
+                    "--file", str(parser_input), "--get-regexp", r"^submodule\..*\.path$",
+                ],
+                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=_REVIEW_GIT_SNAPSHOT_MAX_SECONDS, check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ReviewAuthorityError("registered submodule verification failed") from exc
+        finally:
+            if parser_input is not None:
+                try:
+                    parser_input.unlink()
+                except OSError:
+                    pass
+        if (
+            mapping.returncode != 0
+            or len(mapping.stdout) > 4096
+        ):
+            raise ReviewAuthorityError("workspace is not a registered submodule")
+        mappings: dict[str, str] = {}
+        mapped_paths: set[str] = set()
+        for record in mapping.stdout.split(b"\0"):
+            if not record:
+                continue
+            key, separator, value = record.partition(b"\n")
+            try:
+                decoded_key = key.decode("utf-8")
+                decoded_value = os.fsdecode(value)
+            except (UnicodeDecodeError, UnicodeEncodeError) as exc:
+                raise ReviewAuthorityError("malformed .gitmodules mapping") from exc
+            prefix, suffix = "submodule.", ".path"
+            if (
+                not separator
+                or not decoded_key.startswith(prefix)
+                or not decoded_key.endswith(suffix)
+            ):
+                raise ReviewAuthorityError("malformed .gitmodules mapping")
+            name = decoded_key[len(prefix):-len(suffix)]
+            if not name or name in mappings or decoded_value in mapped_paths:
+                raise ReviewAuthorityError("ambiguous .gitmodules mapping")
+            mappings[name] = decoded_value
+            mapped_paths.add(decoded_value)
+        relative_path = mappings.get(logical_name)
+        if relative_path is None:
+            raise ReviewAuthorityError("workspace is not a registered submodule")
+        path_parts = Path(relative_path).parts
+        if not path_parts or any(part in {"", ".", "..", "modules"} for part in path_parts):
+            raise ReviewAuthorityError("Git submodule administrative relationship mismatch")
+        try:
+            proc = subprocess.run(
+                [
+                    "git", "--no-optional-locks", "-c", "core.fsmonitor=false",
+                    "-c", "core.untrackedCache=false", "-c", f"core.hooksPath={os.devnull}",
+                    f"--git-dir={parent_git_dir}", f"--work-tree={parent_workspace}",
+                    "ls-files", "--stage", "-z", "--", relative_path,
+                ],
+                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=_REVIEW_GIT_SNAPSHOT_MAX_SECONDS, check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ReviewAuthorityError("registered submodule verification failed") from exc
+        if proc.returncode != 0 or len(proc.stdout) > 4096:
+            raise ReviewAuthorityError("workspace is not a registered submodule")
+        raw_path = os.fsencode(relative_path)
+
+        def exact_git_output(
+            repository_git_dir: Path, repository_workspace: Path, *arguments: str
+        ) -> bytes:
+            try:
+                result = subprocess.run(
+                    [
+                        "git", "--no-optional-locks", "-c", "core.fsmonitor=false",
+                        "-c", "core.untrackedCache=false", "-c", f"core.hooksPath={os.devnull}",
+                        f"--git-dir={repository_git_dir}",
+                        f"--work-tree={repository_workspace}", *arguments,
+                    ],
+                    env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    timeout=_REVIEW_GIT_SNAPSHOT_MAX_SECONDS, check=False,
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise ReviewAuthorityError("submodule gitlink HEAD verification failed") from exc
+            output = result.stdout.strip().lower()
+            if result.returncode != 0 or len(output) > 128:
+                raise ReviewAuthorityError("submodule gitlink HEAD verification failed")
+            return output
+
+        object_format = exact_git_output(
+            parent_git_dir, parent_workspace, "rev-parse", "--show-object-format"
+        )
+        oid_length = 40 if object_format == b"sha1" else 64 if object_format == b"sha256" else 0
+        if oid_length == 0:
+            raise ReviewAuthorityError("submodule gitlink has an invalid object id")
+        index_oid = _parse_gitlink_index_oid(proc.stdout, raw_path, oid_length)
+        child_workspace = parent_workspace / relative_path
+        expected_child_git_dir = (parent_git_dir / "modules" / logical_name).resolve(strict=True)
+        child_git_dir = git_dir if depth == len(relative_paths) - 1 else expected_child_git_dir
+        if child_git_dir != expected_child_git_dir:
+            raise ReviewAuthorityError("Git submodule administrative relationship mismatch")
+        child_format = exact_git_output(
+            child_git_dir, child_workspace, "rev-parse", "--show-object-format"
+        )
+        child_head = exact_git_output(
+            child_git_dir, child_workspace, "rev-parse", "--verify", "HEAD^{commit}"
+        )
+        if (
+            child_format != object_format
+            or len(child_head) != oid_length
+            or re.fullmatch(rb"[0-9a-f]+", child_head) is None
+            or child_head != index_oid
+        ):
+            raise ReviewAuthorityError("submodule gitlink OID does not match child HEAD")
+
+        registration = subprocess.run(
+            [
+                "git", "--no-optional-locks", "-c", "core.fsmonitor=false",
+                f"--git-dir={parent_git_dir}", "config", "--local", "--get",
+                f"submodule.{logical_name}.url",
+            ],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=_REVIEW_GIT_SNAPSHOT_MAX_SECONDS, check=False,
+        )
+        if registration.returncode != 0 or not registration.stdout or len(registration.stdout) > 4096:
+            raise ReviewAuthorityError("workspace is not a registered submodule")
+        parent_workspace = parent_workspace / relative_path
+        parent_git_dir = child_git_dir
+    if parent_workspace.resolve(strict=True) != workspace:
+        raise ReviewAuthorityError("Git submodule administrative relationship mismatch")
+
+    def rev_parse(argument: str) -> Path:
+        try:
+            proc = subprocess.run(
+                [*base, "rev-parse", "--path-format=absolute", argument], env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                timeout=_REVIEW_GIT_SNAPSHOT_MAX_SECONDS, check=False,
+            )
+            if proc.returncode != 0 or len(proc.stdout.encode("utf-8")) > 4096:
+                raise ReviewAuthorityError("Git submodule verification failed")
+            return Path(proc.stdout.strip()).resolve(strict=True)
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            raise ReviewAuthorityError("Git submodule verification failed") from exc
+
+    if rev_parse("--show-toplevel") != workspace:
+        raise ReviewAuthorityError("Git submodule command escaped the trusted workspace")
+    common_dir = rev_parse("--git-common-dir")
+    if common_dir != git_dir:
+        raise ReviewAuthorityError("Git submodule common-dir relationship mismatch")
+    return common_dir
+
+
+def _trusted_git_layout(workspace: Path) -> Optional[tuple[Path, Path]]:
+    dotgit = workspace / ".git"
+    if not dotgit.exists():
+        return None
+    if dotgit.is_dir():
+        git_dir = dotgit.resolve(strict=True)
+        common_dir = git_dir
+    elif dotgit.is_file():
+        git_dir = _git_dir_from_file(dotgit)
+        common_dir = _linked_worktree_common_dir(git_dir, dotgit)
+        if common_dir is None:
+            common_dir = _trusted_submodule_common_dir(workspace, git_dir)
+    else:
+        raise ReviewAuthorityError("malformed Git workspace .git entry")
+    if not (git_dir / "HEAD").exists() or not (common_dir / "objects").is_dir():
+        raise ReviewAuthorityError("incomplete Git repository structure")
+    if not ((common_dir / "refs").is_dir() or (common_dir / "packed-refs").is_file()):
+        raise ReviewAuthorityError("Git repository has no refs authority")
+    return git_dir, common_dir
+
+
+def _path_identity(path: Path) -> tuple[str, int, int]:
+    resolved = path.resolve(strict=True)
+    st = resolved.stat()
+    return str(resolved), int(st.st_dev), int(st.st_ino)
+
+
+def _repository_git_dir(worktree: Path) -> Path:
+    dotgit = worktree / ".git"
+    if dotgit.is_dir():
+        git_dir = dotgit.resolve(strict=True)
+    elif dotgit.is_file():
+        layout = _trusted_git_layout(worktree)
+        if layout is None:
+            raise ReviewAuthorityError("Git repository layout disappeared during snapshot")
+        git_dir = layout[0]
+    else:
+        raise ReviewAuthorityError("Git repository layout disappeared during snapshot")
+    if not (git_dir / "HEAD").exists():
+        raise ReviewAuthorityError("incomplete Git repository structure")
+    return git_dir
+
+
+def _capture_trusted_git_snapshot(workspace: Path) -> Optional[dict[str, object]]:
+    layout = _trusted_git_layout(workspace)
+    if layout is None:
+        return None
+    git_dir, common_dir = layout
+    identities = {
+        "workspace": _path_identity(workspace),
+        "git_dir": _path_identity(git_dir),
+        "common_dir": _path_identity(common_dir),
+    }
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": os.environ.get("HOME", ""),
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_PAGER": "cat",
+        "PAGER": "cat",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+    safe_git_options = (
+        "--no-optional-locks",
+        "-c", "core.fsmonitor=false",
+        "-c", "core.untrackedCache=false",
+        "-c", f"core.hooksPath={os.devnull}",
+    )
+    started = time.monotonic()
+
+    def remaining_timeout() -> float:
+        remaining = _REVIEW_GIT_SNAPSHOT_MAX_SECONDS - (time.monotonic() - started)
+        if remaining <= 0:
+            raise ReviewAuthorityError("Git working snapshot time limit exceeded")
+        return remaining
+
+    def run_process(
+        repository: Path | bytes, args: tuple[str | bytes, ...], *, text: bool = False
+    ) -> subprocess.CompletedProcess:
+        use_bytes = isinstance(repository, bytes)
+        encode = os.fsencode if use_bytes else str
+        repository_path = Path(os.fsdecode(repository)).resolve(strict=True)
+        repository_git_dir = _repository_git_dir(repository_path)
+        git_dir_option = encode(f"--git-dir={repository_git_dir}")
+        work_tree_option = encode(f"--work-tree={repository_path}")
+        argv = [
+            encode("git"),
+            *(encode(arg) for arg in safe_git_options),
+            git_dir_option,
+            work_tree_option,
+            *args,
+        ]
+        try:
+            proc = subprocess.run(
+                argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=text, timeout=remaining_timeout(), check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ReviewAuthorityError("Git working snapshot time limit exceeded") from exc
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ReviewAuthorityError("Git snapshot command failed") from exc
+        remaining_timeout()
+        for name, expected in identities.items():
+            current_path = workspace if name == "workspace" else (
+                _trusted_git_layout(workspace) or (None, None)
+            )[{"git_dir": 0, "common_dir": 1}.get(name, 0)]
+            if current_path is None or _path_identity(Path(current_path)) != expected:
+                raise ReviewAuthorityError("Git workspace changed during snapshot")
+        top_level = subprocess.run(
+            [
+                encode("git"),
+                *(encode(arg) for arg in safe_git_options),
+                git_dir_option,
+                work_tree_option,
+                encode("rev-parse"),
+                encode("--show-toplevel"),
+            ],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=False,
+            timeout=remaining_timeout(),
+            check=False,
+        )
+        remaining_timeout()
+        if (
+            top_level.returncode != 0
+            or Path(os.fsdecode(top_level.stdout.rstrip(b"\r\n"))).resolve(strict=True)
+            != repository_path
+        ):
+            raise ReviewAuthorityError("Git command escaped the trusted workspace")
+        return proc
+
+    def run(*args: str) -> str:
+        proc = run_process(workspace, args, text=True)
+        if proc.returncode != 0 or len(proc.stdout.encode("utf-8")) > 4096:
+            raise ReviewAuthorityError("Git snapshot command failed")
+        return proc.stdout.strip()
+
+    def run_bytes(*args: str) -> bytes:
+        proc = run_process(workspace, args)
+        if proc.returncode != 0 or len(proc.stdout) > _REVIEW_GIT_METADATA_MAX_BYTES:
+            raise ReviewAuthorityError("Git working snapshot metadata limit exceeded")
+        return proc.stdout
+
+    def reject_dirty_submodules() -> None:
+        pending = [os.fsencode(workspace)]
+        seen: set[bytes] = set()
+        item_count = 0
+        output_bytes = 0
+        while pending:
+            if time.monotonic() - started > _REVIEW_GIT_SNAPSHOT_MAX_SECONDS:
+                raise ReviewAuthorityError("Git working snapshot time limit exceeded")
+            repository = pending.pop()
+            if repository in seen:
+                raise ReviewAuthorityError("Git submodule inspection cycle detected")
+            seen.add(repository)
+            status_proc = run_process(
+                repository,
+                (b"status", b"--porcelain=v2", b"-z", b"--untracked-files=all",
+                 b"--ignore-submodules=none"),
+            )
+            links_proc = run_process(
+                repository, (b"ls-files", b"--stage", b"-z")
+            )
+            output_bytes += len(status_proc.stdout) + len(links_proc.stdout)
+            if (
+                status_proc.returncode != 0
+                or links_proc.returncode != 0
+                or output_bytes > _REVIEW_GIT_METADATA_MAX_BYTES
+            ):
+                raise ReviewAuthorityError("Git submodule inspection failed or exceeded output limit")
+            if repository != os.fsencode(workspace) and status_proc.stdout:
+                raise ReviewAuthorityError("review authority rejects a dirty submodule")
+            for record in links_proc.stdout.split(b"\0"):
+                if not record.startswith(b"160000 ") or b"\t" not in record:
+                    continue
+                raw_path = record.split(b"\t", 1)[1]
+                item_count += 1
+                if item_count > _REVIEW_GIT_SNAPSHOT_MAX_ITEMS:
+                    raise ReviewAuthorityError("Git submodule inspection item limit exceeded")
+                child = os.path.normpath(os.path.join(repository, raw_path))
+                if os.path.commonpath((repository, child)) != repository:
+                    raise ReviewAuthorityError("Git submodule inspection returned an unsafe path")
+                if os.path.exists(os.path.join(child, b".git")):
+                    pending.append(child)
+
+    object_format = run("rev-parse", "--show-object-format")
+    revision = run("rev-parse", "--verify", "HEAD^{commit}").lower()
+    expected_len = 40 if object_format == "sha1" else 64 if object_format == "sha256" else 0
+    if expected_len == 0 or not re.fullmatch(f"[0-9a-f]{{{expected_len}}}", revision):
+        raise ReviewAuthorityError("Git returned an invalid commit id")
+    run("cat-file", "-e", f"{revision}^{{commit}}")
+    if run("rev-parse", "--verify", "HEAD^{commit}").lower() != revision:
+        raise ReviewAuthorityError("Git HEAD changed during snapshot")
+
+    reject_dirty_submodules()
+    status = run_bytes(
+        "status", "--porcelain=v2", "-z", "--untracked-files=all",
+        "--ignore-submodules=none",
+    )
+    digest = hashlib.sha256()
+    digest.update(b"trusted-git-working-snapshot-v2\0")
+    digest.update(len(status).to_bytes(8, "big"))
+    digest.update(status)
+    content_bytes = 0
+    metadata_bytes = len(status)
+    item_count = 0
+    pending = [workspace]
+    entries: list[tuple[bytes, Path]] = []
+    while pending:
+        if time.monotonic() - started > _REVIEW_GIT_SNAPSHOT_MAX_SECONDS:
+            raise ReviewAuthorityError("Git working snapshot time limit exceeded")
+        directory = pending.pop()
+        try:
+            children = sorted(
+                os.scandir(directory), key=lambda entry: os.fsencode(entry.name)
+            )
+        except OSError as exc:
+            raise ReviewAuthorityError("Git working snapshot walk failed") from exc
+        for child in children:
+            target = Path(child.path)
+            relative = target.relative_to(workspace)
+            # Git administrative entries are outside the reviewed worktree
+            # payload, including the .git files inside checked-out submodules.
+            if relative.name == ".git":
+                continue
+            raw_path = os.fsencode(str(relative))
+            item_count += 1
+            metadata_bytes += len(raw_path) + 16
+            if item_count > _REVIEW_GIT_SNAPSHOT_MAX_ITEMS:
+                raise ReviewAuthorityError("Git working snapshot item limit exceeded")
+            if metadata_bytes > _REVIEW_GIT_METADATA_MAX_BYTES:
+                raise ReviewAuthorityError("Git working snapshot metadata limit exceeded")
+            entries.append((raw_path, target))
+            try:
+                if child.is_dir(follow_symlinks=False):
+                    pending.append(target)
+            except OSError as exc:
+                raise ReviewAuthorityError("Git working snapshot walk failed") from exc
+
+    for raw_path, target in sorted(entries, key=lambda item: item[0]):
+        if time.monotonic() - started > _REVIEW_GIT_SNAPSHOT_MAX_SECONDS:
+            raise ReviewAuthorityError("Git working snapshot time limit exceeded")
+        digest.update(len(raw_path).to_bytes(8, "big"))
+        digest.update(raw_path)
+        try:
+            st = target.lstat()
+        except OSError as exc:
+            raise ReviewAuthorityError("Git workspace changed during snapshot") from exc
+        digest.update(int(st.st_mode).to_bytes(8, "big"))
+        if target.is_symlink():
+            try:
+                payload = os.fsencode(os.readlink(target))
+            except OSError as exc:
+                raise ReviewAuthorityError("Git workspace changed during snapshot") from exc
+            content_bytes += len(payload)
+            if content_bytes > _REVIEW_GIT_SNAPSHOT_MAX_BYTES:
+                raise ReviewAuthorityError("Git working snapshot byte limit exceeded")
+            digest.update(len(payload).to_bytes(8, "big"))
+            digest.update(payload)
+        elif target.is_file():
+            digest.update(int(st.st_size).to_bytes(8, "big"))
+            try:
+                with target.open("rb") as handle:
+                    while chunk := handle.read(1024 * 1024):
+                        content_bytes += len(chunk)
+                        if content_bytes > _REVIEW_GIT_SNAPSHOT_MAX_BYTES:
+                            raise ReviewAuthorityError("Git working snapshot byte limit exceeded")
+                        digest.update(chunk)
+                        if time.monotonic() - started > _REVIEW_GIT_SNAPSHOT_MAX_SECONDS:
+                            raise ReviewAuthorityError("Git working snapshot time limit exceeded")
+            except OSError as exc:
+                raise ReviewAuthorityError("Git workspace changed during snapshot") from exc
+        else:
+            digest.update(b"non-file\0")
+
+    if run("rev-parse", "--verify", "HEAD^{commit}").lower() != revision:
+        raise ReviewAuthorityError("Git HEAD changed during snapshot")
+    return {
+        "inspected_revision": revision,
+        "git_snapshot_digest": digest.hexdigest(),
+        "workspace": identities["workspace"],
+        "git_dir": identities["git_dir"],
+        "common_dir": identities["common_dir"],
+    }
+
+
+def bind_review_run_authority(
+    conn: sqlite3.Connection, task_id: str, workspace: Path | str
+) -> dict[str, object]:
+    task = get_task(conn, task_id)
+    if task is None or task.status != "running" or task.current_run_id is None:
+        raise ReviewAuthorityError("review authority requires a current running run")
+    role = (task.current_step_key or task.assignee or "").strip().lower()
+    if not _is_jerome_workflow_task(task) or role not in {"architect", "critic"}:
+        raise ReviewAuthorityError("review authority applies only to strict review roles")
+    workspace_path = Path(workspace).expanduser().resolve(strict=True)
+    if not workspace_path.is_dir():
+        raise ReviewAuthorityError("review workspace must be a directory")
+    subject_json, subject_digest = _review_subject(conn, task)
+    git = _capture_trusted_git_snapshot(workspace_path)
+    subject_kind = "git_workspace_head_v1" if git else "task_snapshot_v1"
+    inspected_revision = str(git["inspected_revision"]) if git else subject_digest
+    git_snapshot_digest = str(git["git_snapshot_digest"]) if git else None
+    workspace_ident = git["workspace"] if git else _path_identity(workspace_path)
+    git_ident = git["git_dir"] if git else (None, None, None)
+    common_ident = git["common_dir"] if git else (None, None, None)
+    row_values = (
+        int(task.current_run_id), task.id, task.assignee or role, role,
+        _REVIEW_AUTHORITY_MODE, _REVIEW_THREAT_MODEL, subject_kind,
+        task.subject_version, subject_json, subject_digest, inspected_revision,
+        git_snapshot_digest,
+        *workspace_ident, *git_ident, *common_ident, int(time.time()),
+    )
+    try:
+        with write_txn(conn):
+            conn.execute(
+                """INSERT INTO review_run_authority (
+                    run_id, task_id, reviewer_profile, role, authority_mode,
+                    threat_model, subject_kind, subject_version, subject_json,
+                    subject_digest, inspected_revision, git_snapshot_digest,
+                    workspace_realpath, workspace_dev, workspace_ino,
+                    git_dir_realpath, git_dir_dev, git_dir_ino,
+                    common_dir_realpath, common_dir_dev, common_dir_ino, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                row_values,
+            )
+    except sqlite3.IntegrityError as exc:
+        raise ReviewAuthorityError("review authority is already bound for this run") from exc
+    return get_review_run_authority(conn, task.current_run_id) or {}
+
+
+def get_review_run_authority(
+    conn: sqlite3.Connection, run_id: Optional[int]
+) -> Optional[dict[str, object]]:
+    if run_id is None:
+        return None
+    row = conn.execute(
+        "SELECT * FROM review_run_authority WHERE run_id = ?", (int(run_id),)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def update_task_subject(
+    conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
+    body: Optional[str] = None,
+) -> bool:
+    if title is not None and not title.strip():
+        raise ValueError("title cannot be blank")
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT title, body FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        new_title = title.strip() if title is not None else row["title"]
+        new_body = body if body is not None else row["body"]
+        if new_title == row["title"] and new_body == row["body"]:
+            return True
+        active = conn.execute(
+            "SELECT 1 FROM review_run_authority a JOIN task_runs r ON r.id=a.run_id "
+            "JOIN tasks t ON t.id=a.task_id WHERE a.task_id=? "
+            "AND t.current_run_id=a.run_id AND r.ended_at IS NULL",
+            (task_id,),
+        ).fetchone()
+        if active:
+            raise ReviewAuthorityError("cannot mutate subject during active review")
+        conn.execute(
+            "UPDATE tasks SET title=?, body=?, subject_version=subject_version+1 WHERE id=?",
+            (new_title, new_body, task_id),
+        )
+        _append_event(conn, task_id, "edited", None)
+        return True
 
 
 # Canonical sort-order mappings for ``hermes kanban list --sort``.
@@ -3718,7 +4628,9 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
 # ---------------------------------------------------------------------------
 
 def add_comment(
-    conn: sqlite3.Connection, task_id: str, author: str, body: str
+    conn: sqlite3.Connection, task_id: str, author: str, body: str,
+    *, expected_run_id: Optional[int] = None,
+    reviewer_profile: Optional[str] = None,
 ) -> int:
     if not body or not body.strip():
         raise ValueError("comment body is required")
@@ -3728,14 +4640,48 @@ def add_comment(
     # ``allow_nested=True``: graph builders (kanban_swarm blackboard seeding)
     # compose comment writes under one outer commit.
     with write_txn(conn, allow_nested=True):
-        if not conn.execute(
-            "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
-        ).fetchone():
+        task_row = conn.execute(
+            "SELECT current_run_id, status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not task_row:
             raise ValueError(f"unknown task {task_id}")
+        bound_run_id: Optional[int] = None
+        if expected_run_id is not None or reviewer_profile is not None:
+            if expected_run_id is None or not reviewer_profile:
+                raise ValueError("run-bound comment requires run id and reviewer profile")
+            authority = conn.execute(
+                "SELECT reviewer_profile FROM review_run_authority "
+                "WHERE task_id = ? AND run_id = ?",
+                (task_id, int(expected_run_id)),
+            ).fetchone()
+            current_task = get_task(conn, task_id)
+            current_role = (
+                current_task.current_step_key or current_task.assignee or ""
+            ).strip().lower() if current_task else ""
+            strict_review = bool(
+                current_task
+                and _is_jerome_workflow_task(current_task)
+                and current_role in {"architect", "critic"}
+            )
+            if strict_review:
+                run = conn.execute(
+                    "SELECT profile, ended_at FROM task_runs WHERE id = ? AND task_id = ?",
+                    (int(expected_run_id), task_id),
+                ).fetchone()
+                if (
+                    task_row["status"] != "running"
+                    or task_row["current_run_id"] != int(expected_run_id)
+                    or authority is None or run is None or run["ended_at"] is not None
+                    or run["profile"] != reviewer_profile
+                    or authority["reviewer_profile"] != reviewer_profile
+                    or author.strip() != reviewer_profile
+                ):
+                    raise ValueError("comment does not match the current review run/profile")
+                bound_run_id = int(expected_run_id)
         cur = conn.execute(
-            "INSERT INTO task_comments (task_id, author, body, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (task_id, author.strip(), body.strip(), now),
+            "INSERT INTO task_comments (task_id, author, body, created_at, run_id) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (task_id, author.strip(), body.strip(), now, bound_run_id),
         )
         _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
         return int(cur.lastrowid or 0)
@@ -3753,6 +4699,7 @@ def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
             author=r["author"],
             body=r["body"],
             created_at=r["created_at"],
+            run_id=r["run_id"] if "run_id" in r.keys() else None,
         )
         for r in rows
     ]
@@ -3769,7 +4716,7 @@ def list_comments_after(
     ``tools.kanban_tools.inject_new_comments_from_env``).
     """
     rows = conn.execute(
-        "SELECT id, task_id, author, body, created_at FROM task_comments "
+        "SELECT id, task_id, author, body, created_at, run_id FROM task_comments "
         "WHERE task_id = ? AND id > ? ORDER BY id ASC",
         (task_id, int(after_id)),
     ).fetchall()
@@ -3780,6 +4727,7 @@ def list_comments_after(
             author=r["author"],
             body=r["body"],
             created_at=r["created_at"],
+            run_id=r["run_id"] if "run_id" in r.keys() else None,
         )
         for r in rows
     ]
@@ -5192,14 +6140,125 @@ def _task_repo_head(task: Task) -> Optional[str]:
     return proc.stdout.strip() if proc.returncode == 0 else None
 
 
+def _normalize_review_string_lists(meta: dict) -> dict:
+    normalized = json.loads(json.dumps(meta, ensure_ascii=False))
+    combined: dict[str, list[str]] = {}
+    for field_name in ("inspected_symbols", "red_tests"):
+        value = normalized.get(field_name)
+        if not isinstance(value, list) or not 1 <= len(value) <= 256:
+            raise RoleCompletionContractError(
+                f"review provenance {field_name} list bounds rejected"
+            )
+        items: list[str] = []
+        for item in value:
+            if not isinstance(item, str) or not item.strip():
+                raise RoleCompletionContractError(
+                    f"review provenance {field_name} string item rejected"
+                )
+            try:
+                item.encode("utf-8", errors="strict")
+            except UnicodeEncodeError as exc:
+                raise RoleCompletionContractError("review provenance Unicode rejected") from exc
+            item = unicodedata.normalize("NFC", item)
+            if any(unicodedata.category(ch) in {"Cc", "Cf", "Cs", "Zl", "Zp"} for ch in item):
+                raise RoleCompletionContractError("review provenance Unicode rejected")
+            if len(item.encode("utf-8")) > 1024:
+                raise RoleCompletionContractError("review provenance item size rejected")
+            items.append(item)
+        combined[field_name] = items
+        normalized[field_name] = items
+    canonical = json.dumps(combined, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    if len(canonical.encode("utf-8")) > 65_536:
+        raise RoleCompletionContractError("review provenance aggregate size rejected")
+    return normalized
+
+
+def _validate_review_provenance(
+    conn: sqlite3.Connection,
+    task: Task,
+    metadata: Optional[dict],
+) -> tuple[dict, dict[str, object]]:
+    meta = metadata if isinstance(metadata, dict) else {}
+    authority = get_review_run_authority(conn, task.current_run_id)
+    if authority is None:
+        raise RoleCompletionContractError(
+            "review provenance requires current review run authority"
+        )
+    subject_json, subject_digest = _review_subject(conn, task)
+    if (
+        authority["subject_json"] != subject_json
+        or authority["subject_digest"] != subject_digest
+        or int(authority["subject_version"]) != task.subject_version
+        or authority["reviewer_profile"] != task.assignee
+    ):
+        raise RoleCompletionContractError("review authority subject changed")
+    comment_id = meta.get("durable_comment_id")
+    if type(comment_id) is not int or comment_id <= 0:
+        raise RoleCompletionContractError(
+            "architect/critic completion requires review provenance with a positive durable_comment_id"
+        )
+    comment = conn.execute(
+        "SELECT body, author, run_id FROM task_comments WHERE id = ? AND task_id = ?",
+        (comment_id, task.id),
+    ).fetchone()
+    if comment is None or not (comment["body"] or "").strip():
+        raise RoleCompletionContractError(
+            "review provenance durable_comment_id must identify a non-empty comment on the same task"
+        )
+    if comment["run_id"] != task.current_run_id or comment["author"] != authority["reviewer_profile"]:
+        raise RoleCompletionContractError(
+            "review provenance comment must belong to the current review run/profile"
+        )
+    if meta.get("durable_comment_read_back") is not True:
+        raise RoleCompletionContractError("review provenance requires durable_comment_read_back=true")
+    revision = meta.get("inspected_revision")
+    if not isinstance(revision, str) or not _HEX_REVISION_RE.fullmatch(revision):
+        raise RoleCompletionContractError(
+            "review provenance requires a hexadecimal inspected_revision"
+        )
+    if revision != authority["inspected_revision"]:
+        raise RoleCompletionContractError("review provenance inspected_revision mismatch")
+    workspace = Path(str(authority["workspace_realpath"]))
+    try:
+        if _path_identity(workspace) != (
+            authority["workspace_realpath"], authority["workspace_dev"], authority["workspace_ino"]
+        ):
+            raise ReviewAuthorityError("workspace identity changed")
+        if authority["subject_kind"] == "git_workspace_head_v1":
+            current = _capture_trusted_git_snapshot(workspace)
+            if current is None or current["inspected_revision"] != revision:
+                raise ReviewAuthorityError("Git revision changed")
+            if current["git_snapshot_digest"] != authority["git_snapshot_digest"]:
+                raise ReviewAuthorityError("Git working snapshot changed")
+            if current["git_dir"] != (
+                authority["git_dir_realpath"], authority["git_dir_dev"], authority["git_dir_ino"]
+            ) or current["common_dir"] != (
+                authority["common_dir_realpath"], authority["common_dir_dev"], authority["common_dir_ino"]
+            ):
+                raise ReviewAuthorityError("Git repository identity changed")
+    except (OSError, ReviewAuthorityError) as exc:
+        raise RoleCompletionContractError("review authority workspace changed") from exc
+    normalized = _normalize_review_string_lists(meta)
+    machine = {
+        key: authority[key] for key in (
+            "run_id", "task_id", "reviewer_profile", "role", "authority_mode",
+            "threat_model", "subject_kind", "subject_version", "subject_digest",
+            "inspected_revision", "git_snapshot_digest", "workspace_realpath", "git_dir_realpath",
+            "common_dir_realpath", "created_at",
+        )
+    }
+    return normalized, machine
+
+
 def _validate_role_completion_contract(
+    conn: sqlite3.Connection,
     task: Task,
     *,
     summary: Optional[str],
     metadata: Optional[dict],
-) -> None:
+) -> tuple[Optional[dict], Optional[dict[str, object]]]:
     if not _is_jerome_workflow_task(task):
-        return
+        return metadata, None
     if task.status == "blocked":
         raise RoleCompletionContractError(
             "typed workflow blocked task must be explicitly unblocked before completion"
@@ -5208,13 +6267,15 @@ def _validate_role_completion_contract(
     role = (task.current_step_key or task.assignee or "").strip().lower()
     text = summary or ""
     meta = metadata if isinstance(metadata, dict) else {}
-
     valid_roles = {
         "planner", "orchestrator", "architect", "critic",
         "executor", "integrator", "verifier",
     }
     if role not in valid_roles:
         raise RoleCompletionContractError(f"unknown typed workflow role: {role!r}")
+    review_authority = None
+    if role in {"architect", "critic"}:
+        meta, review_authority = _validate_review_provenance(conn, task, metadata)
 
     if role == "critic":
         if _typed_verdict(text, {"OKAY", "ITERATE", "REJECT"}) != "OKAY":
@@ -5223,44 +6284,26 @@ def _validate_role_completion_contract(
             )
     elif role in {"architect", "verifier"}:
         verdict = _typed_verdict(text, {"CLEAR", "WATCH", "BLOCK"})
-        allowed_verdicts = (
-            {"CLEAR", "WATCH", "BLOCK"}
-            if role == "architect"
-            else {"CLEAR", "WATCH"}
-        )
+        allowed_verdicts = {"CLEAR", "WATCH", "BLOCK"} if role == "architect" else {"CLEAR", "WATCH"}
         if verdict not in allowed_verdicts:
-            raise RoleCompletionContractError(
-                f"{role} verdict must be exactly one of {sorted(allowed_verdicts)}"
-            )
+            raise RoleCompletionContractError(f"{role} verdict must be exactly one of {sorted(allowed_verdicts)}")
         if role == "verifier":
             reviewed = meta.get("reviewed_commit")
             integration_head = meta.get("integration_head")
             reviewer = meta.get("reviewer_identity")
             author = meta.get("author_identity")
-            if (
-                not isinstance(reviewed, str)
-                or not _HEX_REVISION_RE.fullmatch(reviewed)
-                or reviewed != integration_head
-            ):
-                raise RoleCompletionContractError(
-                    "verifier requires matching reviewed_commit and integration_head"
-                )
+            if not isinstance(reviewed, str) or not _HEX_REVISION_RE.fullmatch(reviewed) or reviewed != integration_head:
+                raise RoleCompletionContractError("verifier requires matching reviewed_commit and integration_head")
             if _task_repo_head(task) != reviewed:
-                raise RoleCompletionContractError(
-                    "verifier reviewed_commit must equal the task repository HEAD"
-                )
+                raise RoleCompletionContractError("verifier reviewed_commit must equal the task repository HEAD")
             if not isinstance(reviewer, str) or not reviewer.strip():
                 raise RoleCompletionContractError("verifier requires reviewer_identity")
             if not isinstance(author, str) or not author.strip():
                 raise RoleCompletionContractError("verifier requires author_identity")
             if author == reviewer:
-                raise RoleCompletionContractError(
-                    "verifier identity must differ from author_identity"
-                )
+                raise RoleCompletionContractError("verifier identity must differ from author_identity")
             if not _valid_verification_receipts(meta.get("verification"), reviewed):
-                raise RoleCompletionContractError(
-                    "verifier requires typed passing verification receipts"
-                )
+                raise RoleCompletionContractError("verifier requires typed passing verification receipts")
     elif role == "executor":
         revision = meta.get("commit") or meta.get("source_revision")
         if not isinstance(meta.get("changed_files"), list) or not meta["changed_files"]:
@@ -5276,23 +6319,15 @@ def _validate_role_completion_contract(
         commits = meta.get("included_commits")
         if not isinstance(revision, str) or not _HEX_REVISION_RE.fullmatch(revision):
             raise RoleCompletionContractError("integrator completion requires a hexadecimal integrated_head")
-        if not isinstance(commits, list) or not commits or not all(
-            isinstance(item, str) and _HEX_REVISION_RE.fullmatch(item) for item in commits
-        ):
+        if not isinstance(commits, list) or not commits or not all(isinstance(item, str) and _HEX_REVISION_RE.fullmatch(item) for item in commits):
             raise RoleCompletionContractError("integrator completion requires hexadecimal included_commits")
-        if not _revision_exists_in_task_repo(task, revision) or not all(
-            _revision_exists_in_task_repo(task, item) for item in commits
-        ):
-            raise RoleCompletionContractError(
-                "integrator revisions must exist in the task repository"
-            )
+        if not _revision_exists_in_task_repo(task, revision) or not all(_revision_exists_in_task_repo(task, item) for item in commits):
+            raise RoleCompletionContractError("integrator revisions must exist in the task repository")
         if _task_repo_head(task) != revision:
-            raise RoleCompletionContractError(
-                "integrator integrated_head must equal the task repository HEAD"
-            )
+            raise RoleCompletionContractError("integrator integrated_head must equal the task repository HEAD")
         if not _valid_verification_receipts(meta.get("verification"), revision):
             raise RoleCompletionContractError("integrator completion requires typed passing verification receipts")
-
+    return meta, review_authority
 
 def complete_task(
     conn: sqlite3.Connection,
@@ -5409,6 +6444,11 @@ def complete_task(
         task_for_contract = get_task(conn, task_id)
         if task_for_contract is None:
             return False
+        if (
+            expected_run_id is not None
+            and task_for_contract.current_run_id != int(expected_run_id)
+        ):
+            return False
         if _is_jerome_workflow_task(task_for_contract) and summary and result:
             summary_verdict = _typed_verdict(
                 summary, {"OKAY", "ITERATE", "REJECT", "CLEAR", "WATCH", "BLOCK"}
@@ -5420,11 +6460,15 @@ def complete_task(
                 raise RoleCompletionContractError(
                     "conflicting typed workflow result and summary verdicts"
                 )
-        _validate_role_completion_contract(
+        metadata, review_authority = _validate_role_completion_contract(
+            conn,
             task_for_contract,
             summary=canonical_receipt,
             metadata=metadata,
         )
+        if review_authority is not None:
+            metadata = dict(metadata or {})
+            metadata["review_authority"] = review_authority
         role = (
             task_for_contract.current_step_key
             or task_for_contract.assignee
@@ -8061,7 +9105,7 @@ class ReservedRunMetadataError(ValueError):
     """Caller metadata attempted to write a system-owned run field."""
 
 
-_RESERVED_RUN_METADATA_KEYS = frozenset({"runtime_provenance"})
+_RESERVED_RUN_METADATA_KEYS = frozenset({"runtime_provenance", "review_authority"})
 
 
 def _reject_reserved_run_metadata(metadata: Optional[dict]) -> None:
@@ -9191,6 +10235,7 @@ def _record_task_failure(
             else ("review" if row["status"] == "review" else "ready")
         )
         failures = int(row["consecutive_failures"]) + 1
+        failed_run_id = row["current_run_id"]
 
         # Per-task override wins over both caller-supplied and default
         # thresholds. None (the common case) falls through.
@@ -9293,6 +10338,11 @@ def _record_task_failure(
                     run_id=run_id,
                 )
             # Timeout/crash path's caller already emitted its own event.
+        if release_claim and failed_run_id is not None:
+            conn.execute(
+                "DELETE FROM review_run_authority WHERE run_id = ?",
+                (int(failed_run_id),),
+            )
     return blocked
 
 
@@ -10652,6 +11702,18 @@ def _dispatch_once_locked(
             if auto:
                 result.auto_blocked.append(claimed.id)
             continue
+        role = (claimed.current_step_key or claimed.assignee or "").strip().lower()
+        if _is_jerome_workflow_task(claimed) and role in {"architect", "critic"}:
+            try:
+                bind_review_run_authority(conn, claimed.id, workspace)
+            except Exception as exc:
+                auto = _record_spawn_failure(
+                    conn, claimed.id, f"review_authority: {exc}",
+                    failure_limit=failure_limit,
+                )
+                if auto:
+                    result.auto_blocked.append(claimed.id)
+                continue
         # Persist the resolved workspace path so the worker can cd there.
         set_workspace_path(conn, claimed.id, str(workspace))
         if claimed.workspace_kind == "worktree":
@@ -10800,6 +11862,18 @@ def _dispatch_once_locked(
             if auto:
                 result.auto_blocked.append(claimed.id)
             continue
+        role = (claimed.current_step_key or claimed.assignee or "").strip().lower()
+        if _is_jerome_workflow_task(claimed) and role in {"architect", "critic"}:
+            try:
+                bind_review_run_authority(conn, claimed.id, workspace)
+            except Exception as exc:
+                auto = _record_spawn_failure(
+                    conn, claimed.id, f"review_authority: {exc}",
+                    failure_limit=failure_limit,
+                )
+                if auto:
+                    result.auto_blocked.append(claimed.id)
+                continue
         # Persist the resolved workspace path so the worker can cd there.
         set_workspace_path(conn, claimed.id, str(workspace))
         if claimed.workspace_kind == "worktree":
@@ -11564,16 +12638,27 @@ def _default_spawn(
     rotate_bytes, backup_count = worker_log_rotation_config()
     _rotate_worker_log(log_path, rotate_bytes, backup_count)
 
-    # Windows has no trusted runtime proof for the secure Job Object adapter on
-    # this release. Fail before Popen for generic and typed workers alike; never
-    # fall back to CREATE_NEW_PROCESS_GROUP/taskkill or a single-process kill.
-    if _IS_WINDOWS:
+    # Typed reviewers fail closed until the secure Job Object adapter has live
+    # Windows CI proof. Generic workers retain the established Windows Popen
+    # path; reviewer authority is the security boundary being tightened here.
+    if _IS_WINDOWS and review_role in _REVIEWER_ROLES:
         raise ReviewerAuthorityError("UNVERIFIED_PENDING_WINDOWS_CI: secure_job_unavailable")
 
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")
     try:
-        if review_role in _REVIEWER_ROLES and authority_conn is not None:
+        if _IS_WINDOWS:
+            proc = subprocess.Popen(  # noqa: S603 -- fixed argv assembled above
+                cmd,
+                cwd=workspace if os.path.isdir(workspace) else None,
+                stdin=subprocess.DEVNULL,
+                stdout=log_f,
+                stderr=subprocess.STDOUT,
+                env=env,
+                start_new_session=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        elif review_role in _REVIEWER_ROLES and authority_conn is not None:
             proc = _spawn_posix_reviewer(
                 authority_conn, task, cmd,
                 cwd=workspace if os.path.isdir(workspace) else None,

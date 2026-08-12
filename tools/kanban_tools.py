@@ -565,8 +565,8 @@ def _handle_show(args: dict, **kw) -> str:
                 "parents": parents,
                 "children": children,
                 "comments": [
-                    {"author": c.author, "body": c.body,
-                     "created_at": c.created_at}
+                    {"id": c.id, "author": c.author, "body": c.body,
+                     "created_at": c.created_at, "run_id": c.run_id}
                     for c in comments
                 ],
                 "events": [
@@ -1107,7 +1107,15 @@ def _handle_comment(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
-            cid = kb.add_comment(conn, tid, author=author, body=str(body))
+            own_run_id = _worker_run_id(tid)
+            cid = kb.add_comment(
+                conn,
+                tid,
+                author=author,
+                body=str(body),
+                expected_run_id=own_run_id,
+                reviewer_profile=(author if own_run_id is not None else None),
+            )
             return _ok(task_id=tid, comment_id=cid)
         finally:
             conn.close()
