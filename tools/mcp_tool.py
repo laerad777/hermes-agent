@@ -868,8 +868,24 @@ def _wrap_command_with_watchdog(command: str, args: list) -> tuple[str, list]:
     except Exception:
         # Never let watchdog bookkeeping failure block a real MCP connection.
         return command, args
+    watchdog_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "mcp_stdio_watchdog.py"
+    )
+    try:
+        from hermes_cli.kanban_runtime_snapshot import (
+            sealed_python_argv,
+            snapshot_bootstrap_capability,
+        )
+
+        if snapshot_bootstrap_capability() is not None:
+            watchdog_command, watchdog_prefix = sealed_python_argv("tools/mcp_stdio_watchdog.py")
+            return watchdog_command, [
+                *watchdog_prefix, "--ppid", str(my_pid), "--", command, *args,
+            ]
+    except ImportError:
+        pass
     watchdog_args = [
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_stdio_watchdog.py"),
+        watchdog_path,
         "--ppid", str(my_pid),
         "--",
         command,

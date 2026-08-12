@@ -11351,6 +11351,13 @@ def _advertise_agent_env() -> None:
 
 def main():
     """Main entry point for hermes CLI."""
+    from hermes_cli.kanban_runtime_snapshot import snapshot_bootstrap_capability
+
+    runtime_capability = snapshot_bootstrap_capability()
+    if runtime_capability is not None:
+        from hermes_cli.kanban_db import record_worker_runtime_provenance
+
+        record_worker_runtime_provenance(capability=runtime_capability)
     # Cosmetic: make the process show up as 'hermes' instead of 'python3.11'
     # in ps/top/htop.  Non-fatal — just a nicer UX.
     _set_process_title()

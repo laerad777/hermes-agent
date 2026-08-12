@@ -673,12 +673,15 @@ def _handle_complete(args: dict, **kw) -> str:
     if result:
         result = redact_sensitive_text(str(result), force=True)
     if metadata is not None and isinstance(metadata, dict):
-        meta_json = json.dumps(metadata)
+        try:
+            meta_json = json.dumps(metadata, ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError):
+            return tool_error("metadata must be a JSON-safe object/dict")
         meta_json = redact_sensitive_text(meta_json, force=True)
         try:
             metadata = json.loads(meta_json)
         except json.JSONDecodeError:
-            pass
+            return tool_error("metadata redaction produced invalid JSON")
     created_cards = args.get("created_cards")
     artifacts = args.get("artifacts")
     if created_cards is not None:
@@ -1793,6 +1796,7 @@ KANBAN_COMPLETE_SCHEMA = {
             },
             "metadata": {
                 "type": "object",
+                "additionalProperties": True,
                 "description": (
                     "Free-form dict of structured facts about this "
                     "attempt — {\"changed_files\": [...], \"tests_run\": 12, "

@@ -11,6 +11,7 @@ Covers:
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import time
 import types
@@ -18,6 +19,24 @@ import types
 import pytest
 
 from tests.tools.conftest import register_all_web_providers
+
+
+@pytest.fixture(autouse=True)
+def _clear_snapshot_capability():
+    from hermes_cli.kanban_runtime_snapshot import clear_snapshot_bootstrap_capability_after_fork
+
+    package_paths = {
+        name: list(module.__path__)
+        for name, module in tuple(sys.modules.items())
+        if hasattr(module, "__path__")
+    }
+    clear_snapshot_bootstrap_capability_after_fork()
+    yield
+    clear_snapshot_bootstrap_capability_after_fork()
+    for name, paths in package_paths.items():
+        module = sys.modules.get(name)
+        if module is not None and hasattr(module, "__path__"):
+            module.__path__ = paths
 
 
 def _install_fake_ddgs(monkeypatch, *, text_results=None, text_raises=None, text_sleep=None):
@@ -170,6 +189,57 @@ def _assert_worker_reaped(prov) -> None:
 
 @pytest.mark.live_system_guard_bypass
 class TestDDGSProcessIsolation:
+    def test_snapshot_worker_uses_verified_python_bytes(self, monkeypatch):
+        import hermes_cli.kanban_runtime_snapshot as snapshot
+        import plugins.web.ddgs.provider as prov
+
+        captured = {}
+
+        class Proc:
+            pid = 123
+            returncode = 0
+            def communicate(self, _request):
+                return ('{"ok":true,"results":[]}', '')
+            def poll(self):
+                return 0
+
+        monkeypatch.setattr(snapshot, "snapshot_bootstrap_capability", lambda: object())
+        monkeypatch.setattr(snapshot, "sealed_python_argv", lambda _p: ("/python", ["-c", "verified-worker"]))
+        monkeypatch.setattr(prov.subprocess, "Popen", lambda argv, **kwargs: captured.update(argv=argv, kwargs=kwargs) or Proc())
+        monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
+
+        assert prov._run_ddgs_search_bounded("q", 1) == []
+        assert captured["argv"] == ["/python", "-c", "verified-worker"]
+
+    def test_snapshot_worker_command_keeps_verified_bytes_after_payload_swap(self, tmp_path):
+        import hermes_cli.kanban_runtime_snapshot as snapshot
+
+        source = tmp_path / "source"
+        files = {
+            "plugins/web/ddgs/_search_worker.py": "print('verified')\n",
+            "agent/i18n.py": "SUPPORTED_LANGUAGES = {'en': 'English'}\n",
+            "locales/en.yaml": "hello: Hello\n",
+        }
+        for relative, content in files.items():
+            path = source / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
+        spec = snapshot.build_runtime_snapshot(
+            source, repository_id="repo", source_revision="a" * 40,
+            source_dirty=True, cache_root=tmp_path / "cache",
+        )
+        snapshot.install_snapshot_bootstrap_capability(spec)
+        try:
+            command, prefix = snapshot.sealed_python_argv("plugins/web/ddgs/_search_worker.py")
+            target = spec.payload_root / "plugins/web/ddgs/_search_worker.py"
+            target.chmod(0o600)
+            target.write_text("print('attacker')\n")
+
+            completed = subprocess.run([command, *prefix], capture_output=True, text=True, check=False)
+            assert completed.stdout.strip() == "verified"
+        finally:
+            snapshot.clear_snapshot_bootstrap_capability_after_fork()
+
     def test_gil_holding_worker_times_out_and_is_reaped(self, monkeypatch):
         """#68096: parent deadline still fires when the child holds its GIL."""
         _install_fake_ddgs(monkeypatch)

@@ -326,6 +326,14 @@ def get_tool_definitions(
     Returns:
         Filtered list of OpenAI-format tool definitions.
     """
+    from tools.reviewer_surface import canonical_reviewer_definitions, typed_reviewer_active
+
+    if typed_reviewer_active():
+        definitions = canonical_reviewer_definitions()
+        global _last_resolved_tool_names
+        _last_resolved_tool_names = [item["function"]["name"] for item in definitions]
+        return definitions
+
     # Fast path: memoized result when the caller doesn't need stdout prints.
     # The cache key captures every argument-level input; the registry
     # generation captures registry mutations (MCP refresh, plugin load).
@@ -360,7 +368,6 @@ def get_tool_definitions(
         if cached is not None:
             # Update _last_resolved_tool_names so downstream callers see
             # consistent state even on a cache hit.
-            global _last_resolved_tool_names
             _last_resolved_tool_names = [t["function"]["name"] for t in cached]
             # Return a shallow copy of the list but share the dict references —
             # schemas are treated as read-only by all known callers.
@@ -785,7 +792,13 @@ def coerce_tool_args(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     if not args or not isinstance(args, dict):
         return args
 
-    schema = registry.get_schema(tool_name)
+    from tools.reviewer_surface import canonical_reviewer_schema, typed_reviewer_active
+
+    schema = (
+        canonical_reviewer_schema(tool_name)
+        if typed_reviewer_active()
+        else registry.get_schema(tool_name)
+    )
     if not schema:
         return args
 
@@ -1198,10 +1211,29 @@ def handle_function_call(
     Returns:
         Function result as a JSON string.
     """
+    from tools.reviewer_surface import canonical_reviewer_handler, typed_reviewer_active
+
+    reviewer_active = typed_reviewer_active()
+    canonical_handler = canonical_reviewer_handler(function_name) if reviewer_active else None
+    if reviewer_active and canonical_handler is None:
+        return tool_error(f"Unknown tool: {function_name}")
+
     # Coerce string arguments to their schema-declared types (e.g. "42"→42)
     function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):
         function_args = {}
+    if canonical_handler is not None:
+        # Reviewer activation is a security boundary. Dispatch before every
+        # generic/plugin request, execution, hook, transform, and registry seam.
+        handler, is_async = canonical_handler
+        try:
+            if is_async:
+                return _run_async(handler(function_args, task_id=task_id, session_id=session_id))
+            return handler(function_args, task_id=task_id, session_id=session_id)
+        except Exception as exc:
+            error_msg = f"Error executing {function_name}: {exc}"
+            logger.exception(error_msg)
+            return tool_error(_sanitize_tool_error(error_msg))
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
 
     # ── Tool Search bridge dispatch ──────────────────────────────────
