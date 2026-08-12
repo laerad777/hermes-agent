@@ -24,10 +24,16 @@ import tempfile
 import threading
 import time
 import traceback
+import uuid
 from collections import defaultdict
 from contextlib import suppress
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Any, Tuple
 from urllib.parse import quote, urljoin
+
+from hermes_constants import get_hermes_home as _product_details_hermes_home
+from gateway.discord_product_details import validate_discord_product_details
+from plugins.platforms.discord.product_details import DiscordProductDetailStore
 
 from agent.async_utils import (
     consume_detached_task_result as _consume_background_task_result,
@@ -55,6 +61,21 @@ def _format_discord_markdown_link(label: str, url: str) -> str:
     escaped_label = _DISCORD_MARKDOWN_LINK_LABEL_RE.sub(r"\\\1", label)
     escaped_url = quote(url, safe=":/?#[]@!$&'*+,;=%")
     return f"[{escaped_label}](<{escaped_url}>)"
+_DISCORD_PRODUCT_DETAILS_PROTOCOL_PROMPT = (
+    "When product details should be private, end the response with exactly one "
+    "<!--HERMES_DISCORD_DETAILS:v1:<base64url canonical JSON>--> trailer; "
+    "write nothing after it. Otherwise do not emit the trailer."
+)
+
+
+def _with_discord_product_details_protocol(prompt: str | None) -> str:
+    return f"{prompt}\n\n{_DISCORD_PRODUCT_DETAILS_PROTOCOL_PROMPT}" if prompt else _DISCORD_PRODUCT_DETAILS_PROTOCOL_PROMPT
+
+
+@dataclass(frozen=True, slots=True)
+class _DiscordStructuredDeliveryHandle:
+    delivery: Any
+    envelope: Any
 
 
 class _Snowflake:
@@ -1026,6 +1047,13 @@ class DiscordAdapter(BasePlatformAdapter):
         self._ready_event = asyncio.Event()
         self._allowed_user_ids: set = set()  # For button approval authorization
         self._allowed_role_ids: set = set()  # For DISCORD_ALLOWED_ROLES filtering
+        self._product_details_store: DiscordProductDetailStore | None = None
+        try:
+            self._product_details_store = DiscordProductDetailStore(
+                _product_details_hermes_home() / "gateway" / "discord_product_details"
+            )
+        except Exception:
+            logger.warning("Discord product details disabled: secure store unavailable", exc_info=True)
         # Per-adapter snapshot of authorization gate env vars, captured inside
         # the owning profile's runtime scope during connect(). None until then;
         # accessors fall back to live scope-aware reads (issue #72348).
@@ -1339,6 +1367,12 @@ class DiscordAdapter(BasePlatformAdapter):
             @self._client.event
             async def on_ready():
                 logger.info("[%s] Connected as %s", adapter_self.name, adapter_self._client.user)
+
+                if adapter_self._product_details_store is not None:
+                    client = adapter_self._client
+                    if client is None:
+                        return
+                    adapter_self._restore_product_details_views(client)
 
                 # Resolve any usernames in the allowed list to numeric IDs
                 await adapter_self._resolve_allowed_usernames()
@@ -1782,6 +1816,10 @@ class DiscordAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         """Disconnect from Discord."""
         self._disconnecting = True
+        product_details_store = self._product_details_store
+        self._product_details_store = None
+        if product_details_store is not None:
+            product_details_store.close()
         # Cancel the liveness probe first so it can't fire a spurious fatal
         # error / reconnect while we're intentionally tearing the adapter down.
         await self._cancel_liveness_task()
@@ -3035,6 +3073,103 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.debug("Could not build reply-to reference: %s", e)
             return None
 
+    async def _structured_delivery_begin(self, **kwargs):
+        if self._product_details_store is None:
+            return None
+        envelope = validate_discord_product_details(
+            kwargs["metadata"]["discord_product_details"]
+        )
+        thread_id = kwargs["metadata"].get("thread_id")
+        delivery = self._product_details_store.prepare_delivery(
+            logical_id=kwargs["logical_delivery_id"],
+            envelope=envelope,
+            guild_id=(
+                str(kwargs["metadata"]["discord_guild_id"])
+                if kwargs["metadata"].get("discord_guild_id") is not None
+                else None
+            ),
+            channel_id=str(thread_id or kwargs["chat_id"]),
+            owner_user_id=envelope.owner_user_id,
+        )
+        return _DiscordStructuredDeliveryHandle(delivery, envelope)
+
+    def _restore_product_details_views(self, client: Any) -> None:
+        store = self._product_details_store
+        if store is None:
+            return
+        store.maintain()
+        for delivery, envelope, message_id in store.restore_active_deliveries():
+            try:
+                client.add_view(
+                    ProductDetailsView(self, delivery, envelope),
+                    message_id=int(message_id),
+                )
+            except Exception:
+                logger.warning(
+                    "Discord product-details View restore failed",
+                    exc_info=True,
+                )
+
+    async def _structured_delivery_attempt(self, **kwargs):
+        metadata = dict(kwargs["metadata"])
+        metadata["_discord_structured_delivery_handle"] = kwargs["handle"]
+        return metadata
+
+    async def _structured_delivery_finalize(self, **kwargs):
+        handle = kwargs["handle"]
+        store = self._product_details_store
+        if store is None or not isinstance(handle, _DiscordStructuredDeliveryHandle):
+            return
+        if kwargs["outcome"] == "not_sent_exhausted":
+            store.discard_pending(handle.delivery)
+        elif kwargs["outcome"] == "unknown":
+            store.mark_uncertain(handle.delivery)
+
+    async def _bind_product_delivery_or_cleanup(
+        self,
+        delivery: Any,
+        message_id: str,
+        message: Any,
+        *,
+        content: str | None = None,
+    ) -> bool:
+        """Bind a published View, or perform its one and only cleanup attempt.
+
+        ``False`` means cleanup was attempted after a false bind result or a
+        concurrent store shutdown.  Bind exceptions are re-raised unchanged
+        after the same best-effort cleanup.  Callers must not discard again.
+        """
+        store = self._product_details_store
+        if store is None:
+            try:
+                await message.edit(content=content, view=None)
+            except Exception:
+                logger.warning("Discord product-details View cleanup failed", exc_info=True)
+            return False
+        try:
+            bound = store.bind_delivery(delivery, message_id)
+        except Exception:
+            try:
+                await message.edit(content=content, view=None)
+            except Exception:
+                logger.warning("Discord product-details View cleanup failed", exc_info=True)
+            try:
+                store.discard_delivery(delivery)
+            except Exception:
+                logger.warning("Discord product-details row cleanup failed", exc_info=True)
+            raise
+        if bound:
+            return True
+        try:
+            await message.edit(content=content, view=None)
+        except Exception:
+            logger.warning("Discord product-details View cleanup failed", exc_info=True)
+        try:
+            store.discard_delivery(delivery)
+        except Exception:
+            logger.warning("Discord product-details row cleanup failed", exc_info=True)
+        return False
+
     async def send(
         self,
         chat_id: str,
@@ -3102,6 +3237,13 @@ class DiscordAdapter(BasePlatformAdapter):
             # Forum channels reject channel.send() — create a thread post instead.
             if self._is_forum_parent(channel):
                 result = await self._send_to_forum(channel, content)
+                structured_handle = (metadata or {}).get("_discord_structured_delivery_handle")
+                if isinstance(structured_handle, _DiscordStructuredDeliveryHandle):
+                    if self._product_details_store is not None:
+                        self._product_details_store.discard_pending(
+                            structured_handle.delivery
+                        )
+                    result.structured_failure = "unsupported_forum"
                 await asyncio.to_thread(
                     self._record_discord_response,
                     reply_to=reply_to,
@@ -3115,6 +3257,25 @@ class DiscordAdapter(BasePlatformAdapter):
             formatted = self.format_message(content)
             chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
 
+            product_delivery = None
+            product_view = None
+            raw_details = (metadata or {}).get("discord_product_details")
+            structured_handle = (metadata or {}).get("_discord_structured_delivery_handle")
+            if raw_details and isinstance(
+                structured_handle, _DiscordStructuredDeliveryHandle
+            ):
+                try:
+                    envelope = validate_discord_product_details(raw_details)
+                    product_delivery = structured_handle.delivery
+                    product_view = ProductDetailsView(self, product_delivery, envelope)
+                except Exception:
+                    if self._product_details_store is not None:
+                        self._product_details_store.discard_pending(
+                            structured_handle.delivery
+                        )
+                    product_delivery = None
+                    product_view = None
+
             message_ids = []
             # Build the reference from ids — no fetch_message round trip.
             reference = self._reply_reference_for_send(reply_to, channel)
@@ -3125,11 +3286,18 @@ class DiscordAdapter(BasePlatformAdapter):
                 else:  # "first" (default) or "off"
                     chunk_reference = reference if i == 0 else None
                 try:
-                    msg = await channel.send(
-                        content=chunk,
-                        reference=chunk_reference,
-                    )
+                    kwargs = {"content": chunk, "reference": chunk_reference}
+                    if product_view is not None and i == len(chunks) - 1:
+                        kwargs["view"] = product_view
+                    msg = await channel.send(**kwargs)
                 except Exception as e:
+                    if product_delivery is not None:
+                        return SendResult(
+                            success=False,
+                            error=str(e),
+                            retryable=True,
+                            delivery_certainty="unknown",
+                        )
                     err_text = str(e)
                     if (
                         chunk_reference is not None
@@ -3154,6 +3322,18 @@ class DiscordAdapter(BasePlatformAdapter):
                     else:
                         raise
                 message_ids.append(str(msg.id))
+                if product_delivery is not None and i == len(chunks) - 1:
+                    if not await self._bind_product_delivery_or_cleanup(
+                        product_delivery, str(msg.id), msg, content=chunk,
+                    ):
+                        product_delivery = None
+                        product_view = None
+                        return SendResult(
+                            success=True,
+                            message_id=str(msg.id),
+                            delivery_certainty="delivered",
+                            structured_failure="bind_failed",
+                        )
 
             # Track the last message we sent in this channel for history
             # backfill — avoids a full channel.history() scan on hot paths.
@@ -3167,7 +3347,8 @@ class DiscordAdapter(BasePlatformAdapter):
             result = SendResult(
                 success=True,
                 message_id=message_ids[0] if message_ids else None,
-                raw_response={"message_ids": message_ids}
+                raw_response={"message_ids": message_ids},
+                delivery_certainty="delivered" if structured_handle is not None else None,
             )
             await asyncio.to_thread(
                 self._record_discord_response,
@@ -3360,6 +3541,33 @@ class DiscordAdapter(BasePlatformAdapter):
                 channel = await self._client.fetch_channel(int(chat_id))
             msg = channel.get_partial_message(int(message_id))
             formatted = self.format_message(content)
+            product_delivery = None
+            product_view = None
+            if finalize and metadata and metadata.get("discord_product_details"):
+                if self._product_details_store is not None:
+                    try:
+                        envelope = validate_discord_product_details(
+                            metadata["discord_product_details"]
+                        )
+                        product_delivery = self._product_details_store.prepare_delivery(
+                            logical_id=uuid.uuid4().hex,
+                            envelope=envelope,
+                            guild_id=(
+                                str(metadata["discord_guild_id"])
+                                if metadata.get("discord_guild_id") is not None
+                                else None
+                            ),
+                            channel_id=str(chat_id),
+                            owner_user_id=envelope.owner_user_id,
+                        )
+                        product_view = ProductDetailsView(
+                            self, product_delivery, envelope
+                        )
+                    except Exception:
+                        if product_delivery is not None:
+                            self._product_details_store.discard_pending(product_delivery)
+                        product_delivery = None
+                        product_view = None
 
             _preview_key = (str(chat_id), str(message_id))
             _saturated_preview = False
@@ -3374,6 +3582,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 if finalize:
                     return await self._edit_overflow_split(
                         channel, msg, message_id, content,
+                        product_delivery=product_delivery,
+                        product_view=product_view,
                     )
                 formatted = self.truncate_message(
                     formatted, self.MAX_MESSAGE_LENGTH,
@@ -3393,7 +3603,20 @@ class DiscordAdapter(BasePlatformAdapter):
                 self._last_overflow_preview.pop(_preview_key, None)
 
             try:
-                await msg.edit(content=formatted)
+                edit_kwargs: Dict[str, Any] = {"content": formatted}
+                if product_view is not None:
+                    edit_kwargs["view"] = product_view
+                await msg.edit(**edit_kwargs)
+                if product_delivery is not None:
+                    if not await self._bind_product_delivery_or_cleanup(
+                        product_delivery, str(message_id), msg, content=formatted,
+                    ):
+                        return SendResult(
+                            success=True,
+                            message_id=message_id,
+                            delivery_certainty="delivered",
+                            structured_failure="bind_failed",
+                        )
                 if _saturated_preview:
                     self._last_overflow_preview[_preview_key] = formatted
             except Exception as edit_err:
@@ -3405,6 +3628,8 @@ class DiscordAdapter(BasePlatformAdapter):
                     if finalize:
                         return await self._edit_overflow_split(
                             channel, msg, message_id, content,
+                            product_delivery=product_delivery,
+                            product_view=product_view,
                         )
                     # Mid-stream: truncate and retry in place (no split).
                     truncated = self.truncate_message(
@@ -3451,6 +3676,9 @@ class DiscordAdapter(BasePlatformAdapter):
         msg: Any,
         message_id: str,
         content: str,
+        *,
+        product_delivery: Any = None,
+        product_view: Any = None,
     ) -> SendResult:
         """Deliver an oversized final edit across message + continuations.
 
@@ -3474,7 +3702,28 @@ class DiscordAdapter(BasePlatformAdapter):
         if len(chunks) <= 1:
             # Defensive: caller's pre-flight should guarantee >1 chunk, but if
             # not, just edit normally.
-            await msg.edit(content=chunks[0] if chunks else formatted)
+            edit_kwargs: Dict[str, Any] = {
+                "content": chunks[0] if chunks else formatted,
+            }
+            if product_view is not None:
+                edit_kwargs["view"] = product_view
+            try:
+                await msg.edit(**edit_kwargs)
+                if product_delivery is not None:
+                    if not await self._bind_product_delivery_or_cleanup(
+                        product_delivery,
+                        str(message_id),
+                        msg,
+                        content=edit_kwargs["content"],
+                    ):
+                        return SendResult(
+                            success=True,
+                            message_id=message_id,
+                            delivery_certainty="delivered",
+                            structured_failure="bind_failed",
+                        )
+            except Exception:
+                raise
             return SendResult(success=True, message_id=message_id)
 
         # Step 1 — edit the existing message with the first chunk.
@@ -3491,7 +3740,7 @@ class DiscordAdapter(BasePlatformAdapter):
         continuation_ids: list[str] = []
         delivered = 1
         prev_msg = msg
-        for chunk in chunks[1:]:
+        for index, chunk in enumerate(chunks[1:], start=1):
             reference = None
             if hasattr(prev_msg, "to_reference"):
                 try:
@@ -3504,8 +3753,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 # belt-and-suspenders): build the reference from ids so
                 # overflow continuations stay threaded.
                 reference = self._message_reference_from_ids(prev_msg.id, channel)
+            send_kwargs = {"content": chunk, "reference": reference}
+            if product_view is not None and index == len(chunks) - 1:
+                send_kwargs["view"] = product_view
             try:
-                sent = await channel.send(content=chunk, reference=reference)
+                sent = await channel.send(**send_kwargs)
             except Exception as send_err:
                 # Drop the reply anchor and retry once — a deleted/expired
                 # anchor (10008) or system-message reply (50035) shouldn't lose
@@ -3515,8 +3767,11 @@ class DiscordAdapter(BasePlatformAdapter):
                     self.name, send_err,
                 )
                 try:
-                    sent = await channel.send(content=chunk, reference=None)
+                    send_kwargs["reference"] = None
+                    sent = await channel.send(**send_kwargs)
                 except Exception as retry_err:
+                    if product_delivery is not None and self._product_details_store is not None:
+                        self._product_details_store.discard_pending(product_delivery)
                     logger.warning(
                         "[%s] Overflow split: stopped at %d/%d chunks delivered: %s",
                         self.name, delivered, len(chunks), retry_err,
@@ -3538,6 +3793,19 @@ class DiscordAdapter(BasePlatformAdapter):
             continuation_ids.append(new_id)
             delivered += 1
             prev_msg = sent
+
+        if product_delivery is not None:
+            last_id = continuation_ids[-1] if continuation_ids else message_id
+            if not await self._bind_product_delivery_or_cleanup(
+                product_delivery, last_id, prev_msg, content=chunks[-1],
+            ):
+                return SendResult(
+                    success=True,
+                    message_id=last_id,
+                    continuation_message_ids=tuple(continuation_ids),
+                    delivery_certainty="delivered",
+                    structured_failure="bind_failed",
+                )
 
         last_id = continuation_ids[-1] if continuation_ids else message_id
         # Keep the history-backfill fast path pointed at the final visible
@@ -6024,7 +6292,9 @@ class DiscordAdapter(BasePlatformAdapter):
             message_type=msg_type,
             source=source,
             raw_message=interaction,
-            channel_prompt=self._resolve_channel_prompt(channel_id, parent_id or None),
+            channel_prompt=_with_discord_product_details_protocol(
+                self._resolve_channel_prompt(channel_id, parent_id or None)
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -6113,7 +6383,9 @@ class DiscordAdapter(BasePlatformAdapter):
         _parent_channel = self._thread_parent_channel(getattr(interaction, "channel", None))
         _parent_id = str(getattr(_parent_channel, "id", "") or "")
         _skills = self._resolve_channel_skills(thread_id, _parent_id or None)
-        _channel_prompt = self._resolve_channel_prompt(thread_id, _parent_id or None)
+        _channel_prompt = _with_discord_product_details_protocol(
+            self._resolve_channel_prompt(thread_id, _parent_id or None)
+        )
         event = MessageEvent(
             text=text,
             message_type=MessageType.TEXT,
@@ -8106,7 +8378,9 @@ class DiscordAdapter(BasePlatformAdapter):
         _parent_id = str(getattr(_chan, "parent_id", "") or "")
         _chan_id = str(getattr(_chan, "id", ""))
         _skills = self._resolve_channel_skills(_chan_id, _parent_id or None)
-        _channel_prompt = self._resolve_channel_prompt(_chan_id, _parent_id or None)
+        _channel_prompt = _with_discord_product_details_protocol(
+            self._resolve_channel_prompt(_chan_id, _parent_id or None)
+        )
 
         reply_to_id = None
         reply_to_text = None
@@ -8378,7 +8652,46 @@ def _define_discord_view_classes() -> None:
     lazy install sets DISCORD_AVAILABLE=True but leaves the classes
     undefined, causing NameError on the first button interaction.
     """
-    global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, ChoicePickerView
+    global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, ChoicePickerView, ProductDetailsView, ProductDetailButton
+
+    class ProductDetailButton(discord.ui.Button):
+        def __init__(self, adapter, item, custom_id):
+            super().__init__(label=item.label, style=discord.ButtonStyle.secondary, custom_id=custom_id)
+            self._adapter = adapter
+
+        async def callback(self, interaction):
+            try:
+                await interaction.response.defer(ephemeral=True)
+            except Exception:
+                return
+            if not _component_check_auth(
+                interaction,
+                self._adapter._allowed_user_ids,
+                self._adapter._allowed_role_ids,
+            ):
+                await interaction.followup.send(
+                    "This detail is unavailable.",
+                    ephemeral=True,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                return
+            item = self._adapter._product_details_store.lookup(
+                self.custom_id,
+                guild_id=str(getattr(getattr(interaction, "guild", None), "id", "")) or None,
+                channel_id=str(getattr(getattr(interaction, "channel", None), "id", "")),
+                message_id=str(getattr(getattr(interaction, "message", None), "id", "")),
+                user_id=str(getattr(getattr(interaction, "user", None), "id", "")),
+            ) if self._adapter._product_details_store else None
+            text = f"**{item.title}**\n{item.body}" if item else "This detail is unavailable."
+            await interaction.followup.send(
+                text, ephemeral=True, allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+    class ProductDetailsView(discord.ui.View):
+        def __init__(self, adapter, delivery, envelope):
+            super().__init__(timeout=None)
+            for item, custom_id in zip(envelope.items, delivery.custom_ids):
+                self.add_item(ProductDetailButton(adapter, item, custom_id))
 
     class ExecApprovalView(discord.ui.View):
         """
