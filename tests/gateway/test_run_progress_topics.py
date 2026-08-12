@@ -1385,6 +1385,94 @@ async def test_failed_transformed_edit_leaves_normal_send_authoritative(monkeypa
     )
     assert adapter.sent[-1]["content"] == result["final_response"]
 
+def _native_carrier(kind, payload):
+    raw = json.dumps(
+        {"kind": kind, "payload": payload},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    marker = base64.urlsafe_b64encode(raw).decode().rstrip("=")
+    return f"<!--HERMES_DISCORD_NATIVE:v1:{marker}-->"
+
+class CanonicalModalStreamAgent:
+    def __init__(self, **kwargs):
+        self.stream_delta_callback = kwargs.get("stream_delta_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        if self.stream_delta_callback:
+            self.stream_delta_callback("modal summary")
+        return {
+            "final_response": "modal summary\n" + _native_carrier(
+                "modal",
+                {
+                    "title": "Feedback",
+                    "trigger_label": "Open",
+                    "ttl_seconds": 60,
+                    "inputs": [
+                        {"id": "note", "label": "Note", "style": "paragraph"}
+                    ],
+                },
+            ),
+            "response_previewed": True,
+            "messages": [],
+            "api_calls": 1,
+        }
+
+class CanonicalPollStreamAgent:
+    def __init__(self, **kwargs):
+        self.stream_delta_callback = kwargs.get("stream_delta_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        if self.stream_delta_callback:
+            self.stream_delta_callback("poll summary")
+        return {
+            "final_response": "poll summary\n" + _native_carrier(
+                "poll",
+                {
+                    "question": "Ship?",
+                    "answers": [{"text": "Yes"}, {"text": "No"}],
+                    "duration_hours": 24,
+                },
+            ),
+            "response_previewed": True,
+            "messages": [],
+            "api_calls": 1,
+        }
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("agent_cls", "expected_kind", "expected_body"),
+    [
+        (CanonicalModalStreamAgent, "modal", "modal summary"),
+        (CanonicalPollStreamAgent, "poll", "poll summary"),
+    ],
+)
+async def test_canonical_native_carrier_survives_run_agent_completion(
+    monkeypatch, tmp_path, agent_cls, expected_kind, expected_body
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        agent_cls,
+        session_id=f"sess-canonical-{expected_kind}",
+        config_data={
+            "display": {"tool_progress": "off", "interim_assistant_messages": False},
+            "streaming": {"enabled": True, "edit_interval": 0.01, "buffer_threshold": 1},
+        },
+        platform=Platform.DISCORD,
+        chat_id="1234",
+        chat_type="group",
+        thread_id=f"{expected_kind}-thread",
+        adapter_cls=MetadataEditProgressCaptureAdapter,
+    )
+
+    assert result["final_response"] == expected_body
+    assert result["delivery_metadata_response"] == expected_body
+    assert result["delivery_metadata"]["discord_native_payload"].kind == expected_kind
+    assert all("HERMES_DISCORD" not in str(call) for call in adapter.sent + adapter.edits)
+
 @pytest.mark.asyncio
 async def test_base_processing_stops_typing_before_hung_post_delivery_callback(
     monkeypatch,

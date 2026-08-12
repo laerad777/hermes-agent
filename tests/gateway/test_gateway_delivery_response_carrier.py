@@ -1,6 +1,16 @@
+import asyncio
+from unittest.mock import AsyncMock
+
+import pytest
+
 from gateway.discord_product_details import validate_discord_product_details
 from gateway.discord_native import validate_discord_native_payload
 from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    PlatformConfig,
+    SendResult,
     _GatewayDeliveryResponse,
     _merge_gateway_delivery_metadata,
     _unwrap_gateway_delivery_response,
@@ -338,3 +348,170 @@ def test_fallback_explicit_new_payload_replaces_preserved_stream_metadata():
     assert metadata["discord_native_payload"].kind == "user_select"
     assert agent_result["delivery_metadata"] == metadata
     assert agent_result["delivery_metadata_response"] == "summary"
+
+
+class _NativeDeliveryCaptureAdapter(BasePlatformAdapter):
+    def __init__(self):
+        super().__init__(PlatformConfig(enabled=True, token="fake"), Platform.DISCORD)
+        self.deliveries = []
+
+    async def connect(self, *, is_reconnect=False):
+        return True
+
+    async def disconnect(self):
+        return None
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        self.deliveries.append({
+            "chat_id": chat_id,
+            "content": content,
+            "reply_to": reply_to,
+            "metadata": metadata,
+        })
+        return SendResult(success=True, message_id="outbound-1")
+
+    async def get_chat_info(self, chat_id):
+        return {"id": chat_id}
+
+
+def _modal_payload():
+    return validate_discord_native_payload("modal", {
+        "title": "Feedback",
+        "trigger_label": "Open",
+        "ttl_seconds": 60,
+        "inputs": [{"id": "note", "label": "Note", "style": "paragraph"}],
+    })
+
+
+def _poll_payload():
+    return validate_discord_native_payload("poll", {
+        "question": "Ship?",
+        "answers": [{"text": "Yes"}, {"text": "No"}],
+        "duration_hours": 24,
+    })
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["modal", "poll"])
+async def test_native_carrier_reaches_real_base_outbound_metadata(kind):
+    payload = _modal_payload() if kind == "modal" else _poll_payload()
+    adapter = _NativeDeliveryCaptureAdapter()
+    adapter.set_message_handler(
+        lambda _event: _async_value(_GatewayDeliveryResponse(
+            "summary", delivery_metadata={"discord_native_payload": payload}
+        ))
+    )
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="channel-1",
+        user_id="owner-1",
+        chat_type="channel",
+        thread_id="thread-1",
+        scope_id="guild-1",
+    )
+    event = MessageEvent(
+        text="build native UI",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="inbound-1",
+    )
+    session_key = "agent:main:discord:channel:channel-1:thread-1"
+    adapter._active_sessions[session_key] = asyncio.Event()
+
+    await adapter._process_message_background(event, session_key)
+
+    assert len(adapter.deliveries) == 1
+    delivery = adapter.deliveries[0]
+    assert delivery["content"] == "summary"
+    assert delivery["metadata"]["thread_id"] == "thread-1"
+    assert delivery["metadata"]["notify"] is True
+    assert delivery["metadata"]["discord_native_payload"]["kind"] == kind
+    if kind == "poll":
+        assert delivery["metadata"]["_discord_delivery_obligation_id"] == "turn:inbound-1"
+
+
+async def _async_value(value):
+    return value
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["modal", "poll"])
+async def test_run_agent_carrier_reaches_real_discord_adapter_and_store(
+    monkeypatch, tmp_path, kind
+):
+    from gateway.config import GatewayConfig
+    from gateway.run import GatewayRunner
+    from plugins.platforms.discord import adapter as discord_adapter
+    from plugins.platforms.discord.adapter import DiscordAdapter
+    from plugins.platforms.discord.native_interactions import DiscordNativeInteractionStore
+
+    payload = _modal_payload() if kind == "modal" else _poll_payload()
+    payload = type(payload)(payload.kind, payload.payload, "42")
+    if kind == "modal":
+        monkeypatch.setattr(
+            discord_adapter, "build_native_view", lambda *_args, **_kwargs: object()
+        )
+    channel = type("Channel", (), {})()
+    channel.id = 8
+    channel.guild = type("Guild", (), {"id": 7})()
+    message = type("Message", (), {"id": 9, "edit": AsyncMock()})()
+    channel.send = AsyncMock(return_value=message)
+    channel.get_partial_message = lambda _message_id: message
+
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="fake"))
+    adapter._native_interaction_store = DiscordNativeInteractionStore(tmp_path / "native")
+    adapter._client = type("Client", (), {
+        "get_channel": staticmethod(lambda _id: channel),
+        "fetch_channel": AsyncMock(return_value=channel),
+    })()
+    config = GatewayConfig(
+        platforms={Platform.DISCORD: adapter.config},
+        sessions_dir=tmp_path / "sessions",
+    )
+    runner = GatewayRunner(config)
+    runner.adapters = {Platform.DISCORD: adapter}
+    adapter.config.typing_indicator = False
+    adapter.set_message_handler(runner._handle_message)
+
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="8",
+        user_id="42",
+        chat_type="channel",
+        thread_id=None,
+        scope_id="7",
+    )
+    event = MessageEvent(
+        text="build native UI",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="inbound-1",
+    )
+
+    async def _agent_result(*_args, **_kwargs):
+        return _GatewayDeliveryResponse(
+            "summary", delivery_metadata={"discord_native_payload": payload}
+        )
+
+    monkeypatch.setattr(runner, "_handle_message_with_agent", _agent_result)
+    monkeypatch.setattr(runner, "_is_user_authorized", lambda _source: True)
+    await adapter._process_message_background(
+        event, "agent:main:discord:channel:8"
+    )
+
+    if kind == "modal":
+        view_calls = [call for call in channel.send.await_args_list if "view" in call.kwargs]
+        assert len(view_calls) == 1
+        assert view_calls[0].kwargs["view"] is not None
+        rows = adapter._native_interaction_store.connection.execute(
+            "SELECT state, message_id FROM deliveries"
+        ).fetchall()
+        assert rows == [("bound", "9")]
+    else:
+        poll_calls = [call for call in channel.send.await_args_list if "poll" in call.kwargs]
+        assert len(poll_calls) == 1
+        assert poll_calls[0].kwargs["poll"] is not None
+        rows = adapter._native_interaction_store.connection.execute(
+            "SELECT state, message_id FROM poll_deliveries"
+        ).fetchall()
+        assert rows == [("sent", "9")]
