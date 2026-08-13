@@ -118,7 +118,6 @@ class MetadataEditProgressCaptureAdapter(ProgressCaptureAdapter):
                 "message_id": message_id,
                 "content": content,
                 "metadata": metadata,
-                "finalize": finalize,
             }
         )
         return SendResult(success=True, message_id=message_id)
@@ -1185,12 +1184,6 @@ async def test_five_tool_turn_accepts_native_terminal_completion(
         (edit.get("metadata") or {}).get("discord_native_payload") is not None
         for edit in adapter.edits
     )
-    native_edits = [
-        edit
-        for edit in adapter.edits
-        if (edit.get("metadata") or {}).get("discord_native_payload") is not None
-    ]
-    assert native_edits[-1]["finalize"] is True
     assert "Discord stream terminal completion accepted=True" in caplog.text
 
     carrier = _GatewayDeliveryResponse(

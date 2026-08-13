@@ -1157,7 +1157,6 @@ class GatewayStreamConsumer:
                             self._record_turn_final_payload(self._accumulated)
                         elif (
                             current_update_visible
-                            and self._completed_native_kind() is None
                             and (
                                 not self._adapter_requires_finalize
                                 or self._last_edit_overflowed
