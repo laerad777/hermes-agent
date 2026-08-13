@@ -5747,7 +5747,9 @@ class BasePlatformAdapter(ABC):
 
         if result.success:
             await finalize(
-                "bind_failed" if result.structured_failure == "bind_failed" else "success",
+                "bind_failed"
+                if getattr(result, "structured_failure", None) == "bind_failed"
+                else "success",
                 result,
             )
             return result
@@ -5797,7 +5799,9 @@ class BasePlatformAdapter(ABC):
                 if result.success:
                     logger.info("[%s] Send succeeded on retry %d", self.name, attempt)
                     await finalize(
-                        "bind_failed" if result.structured_failure == "bind_failed" else "success",
+                        "bind_failed"
+                        if getattr(result, "structured_failure", None) == "bind_failed"
+                        else "success",
                         result,
                     )
                     return result

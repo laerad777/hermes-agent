@@ -10,6 +10,7 @@ import re
 import secrets
 import sqlite3
 import stat
+import sys
 import time
 import unicodedata
 from dataclasses import dataclass
@@ -236,6 +237,7 @@ class DiscordNativeInteractionStore:
 
     def __init__(self, state_dir: Path) -> None:
         self.state_dir = Path(state_dir)
+        self._directory_fd: int | None = None
         self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         if self.state_dir.is_symlink():
             raise OSError("native interaction state path cannot be a symlink")
@@ -250,17 +252,7 @@ class DiscordNativeInteractionStore:
         self.key_path = self.state_dir / "signing-key-v1"
         self.db_path = self.state_dir / "native-v1.sqlite3"
         self.key = self._load_key()
-        if self.db_path.is_symlink():
-            raise OSError("native interaction database cannot be a symlink")
-        self.connection = sqlite3.connect(self.db_path)
-        db_info = self.db_path.lstat()
-        if not stat.S_ISREG(db_info.st_mode):
-            self.connection.close()
-            raise OSError("native interaction database is not a regular file")
-        if self._euid is not None and db_info.st_uid != self._euid:
-            self.connection.close()
-            raise OSError("native interaction database has an unexpected owner")
-        os.chmod(self.db_path, 0o600)
+        self.connection = self._connect_database()
         self.connection.execute("PRAGMA journal_mode=DELETE")
         self.connection.execute("""
             CREATE TABLE IF NOT EXISTS deliveries(
@@ -314,6 +306,46 @@ class DiscordNativeInteractionStore:
             """)
         self.connection.commit()
         self.maintain()
+
+    def _connect_database(self) -> sqlite3.Connection:
+        """Open the native ledger through a directory-fd bound path on Linux."""
+        if sys.platform.startswith("linux") and Path("/proc/self/fd").is_dir():
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            directory_fd = os.open(self.state_dir, flags)
+            try:
+                directory_info = os.fstat(directory_fd)
+                if not stat.S_ISDIR(directory_info.st_mode):
+                    raise OSError("native interaction state path is not a directory")
+                if self._euid is not None and directory_info.st_uid != self._euid:
+                    raise OSError("native interaction state path has an unexpected owner")
+                anchored = f"/proc/self/fd/{directory_fd}/{self.db_path.name}"
+                connection = sqlite3.connect(f"file:{anchored}?nofollow=1", uri=True)
+                file_info = os.stat(self.db_path.name, dir_fd=directory_fd, follow_symlinks=False)
+                if not stat.S_ISREG(file_info.st_mode):
+                    connection.close()
+                    raise OSError("native interaction database is not a regular file")
+                if self._euid is not None and file_info.st_uid != self._euid:
+                    connection.close()
+                    raise OSError("native interaction database has an unexpected owner")
+                os.chmod(self.db_path.name, 0o600, dir_fd=directory_fd, follow_symlinks=False)
+                self._directory_fd = directory_fd
+                return connection
+            except Exception:
+                os.close(directory_fd)
+                raise
+
+        if self.db_path.is_symlink():
+            raise OSError("native interaction database cannot be a symlink")
+        connection = sqlite3.connect(self.db_path)
+        db_info = self.db_path.lstat()
+        if not stat.S_ISREG(db_info.st_mode):
+            connection.close()
+            raise OSError("native interaction database is not a regular file")
+        if self._euid is not None and db_info.st_uid != self._euid:
+            connection.close()
+            raise OSError("native interaction database has an unexpected owner")
+        os.chmod(self.db_path, 0o600)
+        return connection
 
     def _load_key(self) -> bytes:
         if self.key_path.exists():
@@ -509,3 +541,7 @@ class DiscordNativeInteractionStore:
         if connection is not None:
             connection.close()
             self.connection = None
+        directory_fd = getattr(self, "_directory_fd", None)
+        if directory_fd is not None:
+            os.close(directory_fd)
+            self._directory_fd = None

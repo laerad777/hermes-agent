@@ -1174,3 +1174,33 @@ async def test_product_detail_callback_checks_component_auth_before_store_lookup
     interaction.response.defer.assert_awaited_once_with(ephemeral=True)
     store.lookup.assert_not_awaited()
     interaction.followup.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_product_detail_callback_splits_long_ephemeral_body(monkeypatch):
+    from plugins.platforms.discord import adapter as discord_adapter
+
+    detail = SimpleNamespace(title="Long detail", body="x" * 4000)
+    store = SimpleNamespace(lookup=MagicMock(return_value=detail))
+    real_adapter = DiscordAdapter(PlatformConfig(enabled=True, token="fake-token"))
+    real_adapter._product_details_store = store
+    item = SimpleNamespace(label="one")
+    button = discord_adapter.ProductDetailButton(
+        real_adapter, item, "hpd:v1:x:0:1:sig"
+    )
+    interaction = SimpleNamespace(
+        response=SimpleNamespace(defer=AsyncMock()),
+        followup=SimpleNamespace(send=AsyncMock()),
+        user=SimpleNamespace(id="owner", roles=[]),
+        guild=SimpleNamespace(id="g"),
+        channel=SimpleNamespace(id="c"),
+        message=SimpleNamespace(id="m"),
+    )
+    monkeypatch.setattr(discord_adapter, "_component_check_auth", lambda *args: True)
+
+    await type(button).callback(button, interaction)
+
+    assert interaction.followup.send.await_count >= 2
+    for call in interaction.followup.send.await_args_list:
+        content = call.args[0]
+        assert len(content.encode("utf-16-le")) // 2 <= real_adapter.MAX_MESSAGE_LENGTH

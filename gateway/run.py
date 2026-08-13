@@ -27341,7 +27341,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             )
                             if (
                                 source.platform == Platform.DISCORD
-                                and _queued_native_kind == "poll"
+                                and _queued_native_kind is not None
                             ):
                                 from gateway.platforms.base import (
                                     _merge_gateway_delivery_metadata,

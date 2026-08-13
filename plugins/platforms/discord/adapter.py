@@ -9356,9 +9356,16 @@ def _define_discord_view_classes() -> None:
                 user_id=str(getattr(getattr(interaction, "user", None), "id", "")),
             ) if self._adapter._product_details_store else None
             text = f"**{item.title}**\n{item.body}" if item else "This detail is unavailable."
-            await interaction.followup.send(
-                text, ephemeral=True, allowed_mentions=discord.AllowedMentions.none(),
-            )
+            detail_chunks = self._adapter.truncate_message(
+                text,
+                self._adapter.MAX_MESSAGE_LENGTH,
+            ) or ["This detail is unavailable."]
+            for detail_chunk in detail_chunks:
+                await interaction.followup.send(
+                    detail_chunk,
+                    ephemeral=True,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
 
     class ProductDetailsView(discord.ui.View):
         def __init__(self, adapter, delivery, envelope):

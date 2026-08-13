@@ -809,3 +809,13 @@ def test_native_store_rejects_database_symlink(tmp_path):
 
     with pytest.raises(OSError, match="database cannot be a symlink"):
         DiscordNativeInteractionStore(state_dir)
+
+
+def test_native_store_closes_directory_fd(tmp_path):
+    store = DiscordNativeInteractionStore(tmp_path)
+    directory_fd = store._directory_fd
+    store.close()
+    assert store._directory_fd is None
+    if directory_fd is not None:
+        with pytest.raises(OSError):
+            stat.S_ISDIR(__import__("os").fstat(directory_fd).st_mode)
