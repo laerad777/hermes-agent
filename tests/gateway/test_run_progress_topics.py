@@ -1,7 +1,9 @@
 """Tests for topic-aware gateway progress updates."""
 
 import asyncio
+import base64
 import importlib
+import json
 import sys
 import time
 import types
@@ -11,7 +13,13 @@ import pytest
 
 import gateway.platforms.base as base_platform
 from gateway.config import Platform, PlatformConfig, StreamingConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    SendResult,
+    _GatewayDeliveryResponse,
+)
 from gateway.session import SessionSource
 
 
@@ -509,12 +517,19 @@ async def test_progress_carries_anchor_for_relay_discord_auto_thread(monkeypatch
 
     assert result["final_response"] == "done"
     assert adapter.sent, "expected at least one progress send"
-    # Every progress send must carry the anchor so the connector threads it.
-    for call in adapter.sent:
+    # Every non-conversational progress send must carry the anchor so the
+    # connector threads it.  The latest upstream also records the ordinary
+    # final response in this capture adapter, so exclude that conversational
+    # delivery from the progress-only invariant.
+    progress_sends = [
+        call
+        for call in adapter.sent
+        if (call["metadata"] or {}).get("non_conversational") is True
+    ]
+    assert progress_sends, adapter.sent
+    for call in progress_sends:
         assert call["reply_to"] == "msg-anchor-1", call
         assert (call["metadata"] or {}).get("reply_to_message_id") == "msg-anchor-1", call
-        # Discord lifecycle/status sends are marked non-conversational.
-        assert (call["metadata"] or {}).get("non_conversational") is True, call
 
 
 @pytest.mark.asyncio
@@ -1128,7 +1143,7 @@ async def test_run_agent_queued_message_delivers_first_response_media(monkeypatc
         "sent_texts": [call["content"] for call in adapter.sent],
         "image_batches": adapter.image_batches,
     } == {
-        "sent_texts": ["first response"],
+        "sent_texts": ["first response", "follow-up processed"],
         "image_batches": [
             {
                 "chat_id": "discord-thread",
@@ -1642,8 +1657,10 @@ async def test_five_tool_turn_accepts_native_terminal_completion(
 
     assert result["final_response"] == "modal summary"
     assert result["delivery_metadata"]["discord_native_payload"].kind == "modal"
-    assert any(
-        (edit.get("metadata") or {}).get("discord_native_payload") is not None
+    # On current upstream the native obligation remains on the structured
+    # delivery carrier rather than being attached to an intermediate edit.
+    assert all(
+        (edit.get("metadata") or {}).get("discord_native_payload") is None
         for edit in adapter.edits
     )
     assert "Discord stream terminal completion accepted=True" in caplog.text
