@@ -27326,25 +27326,63 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                     elif first_response:
                         try:
-                            if _already_streamed:
-                                logger.info(
-                                    "Queued follow-up for session %s: final text delivery confirmed; delivering explicit media before continuing.",
-                                    session_key or "?",
+                            _queued_delivery_metadata = _delivery_result.get(
+                                "delivery_metadata"
+                            )
+                            _queued_native = (
+                                _queued_delivery_metadata.get("discord_native_payload")
+                                if isinstance(_queued_delivery_metadata, dict)
+                                else None
+                            )
+                            _queued_native_kind = (
+                                _queued_native.get("kind")
+                                if isinstance(_queued_native, dict)
+                                else getattr(_queued_native, "kind", None)
+                            )
+                            if (
+                                source.platform == Platform.DISCORD
+                                and _queued_native_kind == "poll"
+                            ):
+                                from gateway.platforms.base import (
+                                    _merge_gateway_delivery_metadata,
+                                )
+
+                                _queued_metadata = dict(_status_thread_metadata or {})
+                                _queued_metadata["notify"] = True
+                                if event_message_id:
+                                    _queued_metadata[
+                                        "_discord_delivery_obligation_id"
+                                    ] = f"turn:{event_message_id}"
+                                _queued_metadata = _merge_gateway_delivery_metadata(
+                                    _queued_metadata, _queued_delivery_metadata
+                                )
+                                _final_adapter = adapter._final_delivery_adapter(source)
+                                await _final_adapter._send_with_retry(
+                                    source.chat_id,
+                                    first_response,
+                                    metadata=_queued_metadata,
                                 )
                             else:
-                                logger.info(
-                                    "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
-                                    session_key or "?",
+                                if _already_streamed:
+                                    logger.info(
+                                        "Queued follow-up for session %s: final text delivery confirmed; delivering explicit media before continuing.",
+                                        session_key or "?",
+                                    )
+                                else:
+                                    logger.info(
+                                        "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
+                                        session_key or "?",
+                                    )
+                                await self._deliver_queued_first_response(
+                                    first_response,
+                                    source=source,
+                                    adapter=adapter,
+                                    metadata=_status_thread_metadata,
+                                    event_message_id=event_message_id,
+                                    text_already_delivered=_already_streamed,
+                                    deliver_media=not _delivery_result.get("failed"),
                                 )
-                            await self._deliver_queued_first_response(
-                                first_response,
-                                source=source,
-                                adapter=adapter,
-                                metadata=_status_thread_metadata,
-                                event_message_id=event_message_id,
-                                text_already_delivered=_already_streamed,
-                                deliver_media=not _delivery_result.get("failed"),
-                            )
+
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)
                     # Release deferred bg-review notifications now that the
