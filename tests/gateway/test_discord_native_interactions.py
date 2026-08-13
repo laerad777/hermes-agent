@@ -13,6 +13,7 @@ from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
 from plugins.platforms.discord.adapter import DiscordAdapter
 from plugins.platforms.discord.native_interactions import (
     DiscordNativeInteractionStore,
+    SecureStoreUnavailable,
     build_native_view,
     native_route_allows,
     sanitize_ephemeral_items,
@@ -830,3 +831,9 @@ def test_native_store_closes_directory_fd(tmp_path):
     if directory_fd is not None:
         with pytest.raises(OSError):
             stat.S_ISDIR(__import__("os").fstat(directory_fd).st_mode)
+
+
+def test_native_store_fails_closed_on_recovery_marker(tmp_path):
+    (tmp_path / ".native-v1.sqlite3.recovery").write_bytes(b"")
+    with pytest.raises(SecureStoreUnavailable, match="recovery_required"):
+        DiscordNativeInteractionStore(tmp_path)

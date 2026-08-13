@@ -250,6 +250,17 @@ class DiscordNativeInteractionStore:
         self._euid = self._secure._euid
         self.key_path = self.state_dir / "signing-key-v1"
         self.db_path = self.state_dir / "native-v1.sqlite3"
+        self.recovery_path = self.state_dir / ".native-v1.sqlite3.recovery"
+        try:
+            os.stat(
+                self.recovery_path.name,
+                dir_fd=self._directory_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            raise SecureStoreUnavailable("native_snapshot_recovery_required")
         self.key = self._load_key()
         self.connection = self._connect_database()
         self.connection.execute("PRAGMA journal_mode=DELETE")
@@ -382,9 +393,21 @@ class DiscordNativeInteractionStore:
         finally:
             os.close(fd)
         backup_name = f".{self.db_path.name}.rollback"
+        recovery_name = self.recovery_path.name
         had_snapshot = False
         published = False
         try:
+            marker_fd = os.open(
+                recovery_name,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=self._directory_fd,
+            )
+            try:
+                os.fsync(marker_fd)
+            finally:
+                os.close(marker_fd)
+            os.fsync(self._directory_fd)
             try:
                 os.rename(
                     self.db_path.name, backup_name,
@@ -404,7 +427,8 @@ class DiscordNativeInteractionStore:
             os.fsync(self._directory_fd)
             if had_snapshot:
                 os.unlink(backup_name, dir_fd=self._directory_fd)
-                os.fsync(self._directory_fd)
+            os.unlink(recovery_name, dir_fd=self._directory_fd)
+            os.fsync(self._directory_fd)
         except BaseException as publication_error:
             try:
                 if published:
@@ -422,6 +446,8 @@ class DiscordNativeInteractionStore:
                         src_dir_fd=self._directory_fd,
                         dst_dir_fd=self._directory_fd,
                     )
+                os.fsync(self._directory_fd)
+                os.unlink(recovery_name, dir_fd=self._directory_fd)
                 os.fsync(self._directory_fd)
             except BaseException as rollback_error:
                 raise SecureStoreUnavailable("native_snapshot_recovery_required") from ExceptionGroup(
