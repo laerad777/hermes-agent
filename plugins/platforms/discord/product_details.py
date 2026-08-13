@@ -108,7 +108,10 @@ def secure_store_capability(
 class _PosixSecureStorePrimitives:
     def __init__(self, capability: SecureStoreCapability) -> None:
         self.capability = capability
-        self._euid = os.geteuid()
+        get_euid = getattr(os, "geteuid", None)
+        if not callable(get_euid):
+            raise OSError("POSIX effective-user ownership checks are unavailable")
+        self._euid = get_euid()
 
     def open_directory(self, path: Path, *, create: bool) -> int:
         """Walk from root using same-directory handles; optionally create leaf."""
