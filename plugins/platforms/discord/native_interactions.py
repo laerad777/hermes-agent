@@ -436,7 +436,30 @@ class DiscordNativeInteractionStore:
                 os.unlink(recovery_name, dir_fd=self._directory_fd)
                 os.fsync(self._directory_fd)
             except BaseException as cleanup_error:
+                # A failure after marker deletion is not rollback-safe: the
+                # namespace may already contain the new snapshot while marker
+                # durability is unknown. Recreate a durable marker and fail
+                # closed rather than entering the ordinary rollback cleanup.
+                try:
+                    marker_fd = os.open(
+                        recovery_name,
+                        os.O_CREAT | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
+                        0o600,
+                        dir_fd=self._directory_fd,
+                    )
+                    try:
+                        os.fsync(marker_fd)
+                    finally:
+                        os.close(marker_fd)
+                    os.fsync(self._directory_fd)
+                except BaseException as marker_error:
+                    raise SecureStoreUnavailable("native_snapshot_recovery_required") from ExceptionGroup(
+                        "native snapshot cleanup and recovery marker failed",
+                        [cleanup_error, marker_error],
+                    )
                 raise SecureStoreUnavailable("native_snapshot_recovery_required") from cleanup_error
+        except SecureStoreUnavailable:
+            raise
         except BaseException as publication_error:
             try:
                 if published:
