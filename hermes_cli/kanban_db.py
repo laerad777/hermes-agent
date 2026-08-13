@@ -2903,8 +2903,6 @@ def create_task(
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
     session_id: Optional[str] = None,
-    workflow_template_id: Optional[str] = None,
-    current_step_key: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
@@ -3219,9 +3217,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id,
-                        workflow_template_id, current_step_key
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3247,8 +3244,6 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
-                        workflow_template_id,
-                        current_step_key,
                     ),
                 )
                 for pid in parents:
@@ -3273,8 +3268,6 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
-                        "workflow_template_id": workflow_template_id,
-                        "current_step_key": current_step_key,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -4840,187 +4833,6 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
-class RoleCompletionContractError(ValueError):
-    """Raised when a Jerome typed-workflow card lacks a safe receipt."""
-
-
-_JEROME_WORKFLOW_TEMPLATE = "jerome-kanban-v1"
-_JEROME_WORKFLOW_MARKER = "WORKFLOW_CONTRACT: jerome-kanban-v1"
-_HEX_REVISION_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
-
-
-def _typed_verdict(summary: str, allowed: set[str]) -> Optional[str]:
-    found: list[str] = []
-    for raw_line in summary.splitlines():
-        line = raw_line.strip().upper()
-        value = line if line in allowed else None
-        match = re.match(
-            r"^(?:VERDICT|ARCHITECTURAL STATUS|STATUS)\s*:\s*([A-Z]+)\s*$",
-            line,
-        )
-        if value is None and match and match.group(1) in allowed:
-            value = match.group(1)
-        if value is not None:
-            found.append(value)
-    return found[0] if len(found) == 1 else None
-
-
-def _valid_verification_receipts(value: object, revision: str) -> bool:
-    if not isinstance(value, list) or not value:
-        return False
-    for receipt in value:
-        if not isinstance(receipt, dict):
-            return False
-        command = receipt.get("command")
-        result = receipt.get("result")
-        head = receipt.get("head")
-        exit_code = receipt.get("exit_code")
-        if not isinstance(command, str) or not command.strip():
-            return False
-        if not isinstance(result, str) or not result.strip():
-            return False
-        if exit_code != 0 or head != revision:
-            return False
-    return True
-
-
-def _revision_exists_in_task_repo(task: Task, revision: str) -> bool:
-    workspace = task.workspace_path
-    if not workspace or not os.path.isabs(workspace) or not os.path.isdir(workspace):
-        return False
-    try:
-        proc = subprocess.run(
-            ["git", "cat-file", "-e", f"{revision}^{{commit}}"],
-            cwd=workspace,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return proc.returncode == 0
-
-
-def _task_repo_head(task: Task) -> Optional[str]:
-    workspace = task.workspace_path
-    if not workspace or not os.path.isabs(workspace) or not os.path.isdir(workspace):
-        return None
-    try:
-        proc = subprocess.run(
-            ["git", "rev-parse", "--verify", "HEAD^{commit}"],
-            cwd=workspace,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return proc.stdout.strip() if proc.returncode == 0 else None
-
-
-def _validate_role_completion_contract(
-    task: Task,
-    *,
-    summary: Optional[str],
-    metadata: Optional[dict],
-) -> None:
-    typed = (
-        task.workflow_template_id == _JEROME_WORKFLOW_TEMPLATE
-        or _JEROME_WORKFLOW_MARKER in (task.body or "")
-    )
-    if not typed:
-        return
-    if task.status == "blocked":
-        raise RoleCompletionContractError(
-            "typed workflow blocked task must be explicitly unblocked before completion"
-        )
-
-    role = (task.current_step_key or task.assignee or "").strip().lower()
-    text = summary or ""
-    meta = metadata if isinstance(metadata, dict) else {}
-
-    valid_roles = {
-        "planner", "orchestrator", "architect", "critic",
-        "executor", "integrator", "verifier",
-    }
-    if role not in valid_roles:
-        raise RoleCompletionContractError(f"unknown typed workflow role: {role!r}")
-
-    if role == "critic":
-        if _typed_verdict(text, {"OKAY", "ITERATE", "REJECT"}) != "OKAY":
-            raise RoleCompletionContractError(
-                "Critic verdict must be exactly one OKAY; ITERATE/REJECT must block"
-            )
-    elif role in {"architect", "verifier"}:
-        if _typed_verdict(text, {"CLEAR", "WATCH", "BLOCK"}) not in {"CLEAR", "WATCH"}:
-            raise RoleCompletionContractError(
-                f"{role} verdict must be exactly one CLEAR or WATCH"
-            )
-        if role == "verifier":
-            reviewed = meta.get("reviewed_commit")
-            integration_head = meta.get("integration_head")
-            reviewer = meta.get("reviewer_identity")
-            author = meta.get("author_identity")
-            if (
-                not isinstance(reviewed, str)
-                or not _HEX_REVISION_RE.fullmatch(reviewed)
-                or reviewed != integration_head
-            ):
-                raise RoleCompletionContractError(
-                    "verifier requires matching reviewed_commit and integration_head"
-                )
-            if _task_repo_head(task) != reviewed:
-                raise RoleCompletionContractError(
-                    "verifier reviewed_commit must equal the task repository HEAD"
-                )
-            if not isinstance(reviewer, str) or not reviewer.strip():
-                raise RoleCompletionContractError("verifier requires reviewer_identity")
-            if not isinstance(author, str) or not author.strip():
-                raise RoleCompletionContractError("verifier requires author_identity")
-            if author == reviewer:
-                raise RoleCompletionContractError(
-                    "verifier identity must differ from author_identity"
-                )
-            if not _valid_verification_receipts(meta.get("verification"), reviewed):
-                raise RoleCompletionContractError(
-                    "verifier requires typed passing verification receipts"
-                )
-    elif role == "executor":
-        revision = meta.get("commit") or meta.get("source_revision")
-        if not isinstance(meta.get("changed_files"), list) or not meta["changed_files"]:
-            raise RoleCompletionContractError("executor completion requires changed_files")
-        if not isinstance(revision, str) or not _HEX_REVISION_RE.fullmatch(revision):
-            raise RoleCompletionContractError("executor completion requires a hexadecimal source revision")
-        if not _revision_exists_in_task_repo(task, revision):
-            raise RoleCompletionContractError("executor source revision must exist in the task repository")
-        if not _valid_verification_receipts(meta.get("verification"), revision):
-            raise RoleCompletionContractError("executor completion requires typed passing verification receipts")
-    elif role == "integrator":
-        revision = meta.get("integrated_head")
-        commits = meta.get("included_commits")
-        if not isinstance(revision, str) or not _HEX_REVISION_RE.fullmatch(revision):
-            raise RoleCompletionContractError("integrator completion requires a hexadecimal integrated_head")
-        if not isinstance(commits, list) or not commits or not all(
-            isinstance(item, str) and _HEX_REVISION_RE.fullmatch(item) for item in commits
-        ):
-            raise RoleCompletionContractError("integrator completion requires hexadecimal included_commits")
-        if not _revision_exists_in_task_repo(task, revision) or not all(
-            _revision_exists_in_task_repo(task, item) for item in commits
-        ):
-            raise RoleCompletionContractError(
-                "integrator revisions must exist in the task repository"
-            )
-        if _task_repo_head(task) != revision:
-            raise RoleCompletionContractError(
-                "integrator integrated_head must equal the task repository HEAD"
-            )
-        if not _valid_verification_receipts(meta.get("verification"), revision):
-            raise RoleCompletionContractError("integrator completion requires typed passing verification receipts")
-
-
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5060,15 +4872,6 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
-
-    task_for_contract = get_task(conn, task_id)
-    if task_for_contract is None:
-        return False
-    _validate_role_completion_contract(
-        task_for_contract,
-        summary=summary if summary is not None else result,
-        metadata=metadata,
-    )
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -9120,15 +8923,6 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         try:
             cfg = load_config()
             toolsets = sorted(_get_platform_tools(cfg, "cli"))
-            configured_cli = ((cfg.get("platform_toolsets") or {}).get("cli") or [])
-            if "review-readonly" in configured_cli:
-                toolsets = [ts for ts in toolsets if ts != "kanban"]
-                if "kanban-worker-lifecycle" not in toolsets:
-                    toolsets.append("kanban-worker-lifecycle")
-            elif "integration-worker" in configured_cli:
-                toolsets = [ts for ts in toolsets if ts != "kanban"]
-                if "kanban-worker-lifecycle" not in toolsets:
-                    toolsets.append("kanban-worker-lifecycle")
         finally:
             reset_hermes_home_override(token)
         return toolsets or None

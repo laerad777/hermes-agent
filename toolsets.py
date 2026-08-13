@@ -304,25 +304,6 @@ TOOLSETS = {
         "includes": [],
     },
 
-    "kanban-worker-lifecycle": {
-        "description": "Task-scoped Kanban worker lifecycle without graph-routing or attachment mutation",
-        "tools": [
-            "kanban_show", "kanban_complete", "kanban_block",
-            "kanban_heartbeat", "kanban_attachments",
-        ],
-        "includes": [],
-    },
-
-    "integration-worker": {
-        "description": "Bounded local integration tools: workspace files, shell checks, and read-only skill guidance",
-        "tools": [
-            "terminal", "process",
-            "read_file", "write_file", "patch", "search_files",
-            "skills_list", "skill_view",
-        ],
-        "includes": [],
-    },
-
     "discord": {
         "description": "Discord read and participate tools (fetch messages, search members, create threads)",
         "tools": ["discord"],
@@ -384,16 +365,6 @@ TOOLSETS = {
         "description": "Safe toolkit without terminal access",
         "tools": [],
         "includes": ["web", "vision", "image_gen"]
-    },
-
-    "review-readonly": {
-        "description": "Strict read-only review tools without shell, file mutation, delegation, or external side effects",
-        "tools": [
-            "read_file", "search_files",
-            "web_search", "web_extract",
-            "skills_list", "skill_view",
-        ],
-        "includes": [],
     },
 
     # Coding posture (base Hermes — CLI/TUI/desktop/ACP). Auto-selected in a

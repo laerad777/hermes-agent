@@ -249,32 +249,6 @@ def _format_roster(roster: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def _validate_parent_indices(
-    parents: object,
-    *,
-    task_index: int,
-    task_count: int,
-) -> list[int]:
-    """Fail closed on malformed dependency references.
-
-    Silently dropping a bad parent can turn a gated implementation card into
-    immediately runnable work.  Preserve order, de-duplicate valid indices,
-    and reject every malformed, out-of-range, or self reference.
-    """
-    if not isinstance(parents, list):
-        raise ValueError("parents must be a list of task indices")
-    invalid = [
-        p for p in parents
-        if isinstance(p, bool)
-        or not isinstance(p, int)
-        or not (0 <= p < task_count)
-        or p == task_index
-    ]
-    if invalid:
-        raise ValueError(f"invalid parent index value(s): {invalid}")
-    return list(dict.fromkeys(parents))
-
-
 def _normalize_assignee_choice(
     assignee: object,
     *,
@@ -443,15 +417,11 @@ def decompose_task(
                 "routing to default_assignee %r",
                 task_id, idx, assignee, default_assignee,
             )
-        parents = entry.get("parents", [])
-        try:
-            clean_parents = _validate_parent_indices(
-                parents,
-                task_index=idx,
-                task_count=len(raw_tasks),
-            )
-        except ValueError as exc:
-            return DecomposeOutcome(task_id, False, f"tasks[{idx}] {exc}")
+        parents = entry.get("parents") or []
+        if not isinstance(parents, list):
+            parents = []
+        # Clean parent indices: drop non-int and out-of-range.
+        clean_parents = [p for p in parents if isinstance(p, int) and 0 <= p < len(raw_tasks) and p != idx]
         children.append({
             "title": title.strip()[:200],
             "body": body.strip(),

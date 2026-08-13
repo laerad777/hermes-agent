@@ -392,13 +392,13 @@ def _compute_tool_definitions(
             os.environ.get("HERMES_KANBAN_TASK")
             and not _is_delegated_child_context()
             and "kanban" not in effective_enabled_toolsets
-            and "kanban-worker-lifecycle" not in effective_enabled_toolsets
         ):
             # Dispatcher-spawned workers are scoped by HERMES_KANBAN_TASK and
-            # must always receive their own lifecycle handoff tools. Graph
-            # routing and attachment mutation remain explicit orchestrator
-            # capabilities rather than ambient worker authority.
-            effective_enabled_toolsets.append("kanban-worker-lifecycle")
+            # must always receive the lifecycle handoff tools. Assignee
+            # profiles may intentionally restrict their normal chat toolsets
+            # (for token/cost reasons), but that should not strip the kanban
+            # worker's completion/block/heartbeat surface.
+            effective_enabled_toolsets.append("kanban")
         for toolset_name in effective_enabled_toolsets:
             if validate_toolset(toolset_name):
                 resolved = resolve_toolset(toolset_name)

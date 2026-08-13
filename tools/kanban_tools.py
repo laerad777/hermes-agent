@@ -1265,12 +1265,6 @@ def _handle_create(args: dict, **kw) -> str:
     goal_max_turns = args.get("goal_max_turns")
     model_override = args.get("model")
     provider_override = args.get("provider")
-    workflow_template_id = args.get("workflow_template_id")
-    current_step_key = args.get("current_step_key")
-    if workflow_template_id is not None and not str(workflow_template_id).strip():
-        return tool_error("workflow_template_id cannot be blank")
-    if current_step_key is not None and not str(current_step_key).strip():
-        return tool_error("current_step_key cannot be blank")
     if provider_override and not model_override:
         return tool_error("'provider' requires 'model' to be set as well")
     if isinstance(parents, str):
@@ -1321,14 +1315,6 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
-                workflow_template_id=(
-                    str(workflow_template_id).strip()
-                    if workflow_template_id is not None else None
-                ),
-                current_step_key=(
-                    str(current_step_key).strip()
-                    if current_step_key is not None else None
-                ),
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -2088,20 +2074,6 @@ KANBAN_CREATE_SCHEMA = {
                     "provider — a model name alone is resolved against "
                     "the profile's provider and will fail if it belongs "
                     "to a different one. Requires 'model'."
-                ),
-            },
-            "workflow_template_id": {
-                "type": "string",
-                "description": (
-                    "Immutable workflow contract id. Jerome's strict role "
-                    "pipeline uses 'jerome-kanban-v1'."
-                ),
-            },
-            "current_step_key": {
-                "type": "string",
-                "description": (
-                    "Immutable workflow role for completion gates, e.g. "
-                    "planner, architect, critic, executor, integrator, verifier."
                 ),
             },
             "board": _board_schema_prop(),
