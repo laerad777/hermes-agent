@@ -5441,11 +5441,13 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             # MCP 1.x exposes camelCase Pydantic attributes while MCP 2.x
             # exposes snake_case attributes with camelCase serialization aliases.
             # Read both shapes so a dependency drift cannot break every tool call.
-            is_error = getattr(
-                result,
-                "is_error",
-                getattr(result, "isError", False),
-            )
+            result_attrs = set(dir(result))
+            if "is_error" in result_attrs:
+                is_error = getattr(result, "is_error")
+            elif "isError" in result_attrs:
+                is_error = getattr(result, "isError")
+            else:
+                is_error = False
             if is_error:
                 error_text = ""
                 for block in (result.content or []):
@@ -5515,11 +5517,12 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             # MCP spec: content is model-oriented (text), structuredContent
             # is machine-oriented (JSON metadata).  For an AI agent, content
             # is the primary payload; structuredContent supplements it.
-            structured = getattr(
-                result,
-                "structured_content",
-                getattr(result, "structuredContent", None),
-            )
+            if "structured_content" in result_attrs:
+                structured = getattr(result, "structured_content")
+            elif "structuredContent" in result_attrs:
+                structured = getattr(result, "structuredContent")
+            else:
+                structured = None
             if structured is not None:
                 if text_result:
                     return json.dumps({
