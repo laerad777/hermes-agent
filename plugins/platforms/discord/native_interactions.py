@@ -358,13 +358,9 @@ class DiscordNativeInteractionStore:
         )
         return connection
 
-    def _commit(self) -> None:
-        self.connection.commit()
-        if self.capability.backend != "darwin-snapshot":
-            return
+    def _persist_snapshot_bytes(self, data: bytes) -> None:
         if self._directory_fd is None:
             raise SecureStoreUnavailable("native interaction state store is closed")
-        data = self.connection.serialize()
         temporary_name = f".{self.db_path.name}.{secrets.token_hex(8)}.tmp"
         fd = os.open(
             temporary_name,
@@ -397,6 +393,19 @@ class DiscordNativeInteractionStore:
                 os.unlink(temporary_name, dir_fd=self._directory_fd)
             except FileNotFoundError:
                 pass
+
+    def _commit(self) -> None:
+        if self.capability.backend != "darwin-snapshot":
+            self.connection.commit()
+            return
+        try:
+            # Serialize and durably publish while the transaction is still
+            # rollback-capable.  Only then make the in-memory state visible.
+            self._persist_snapshot_bytes(self.connection.serialize())
+            self.connection.commit()
+        except BaseException:
+            self.connection.rollback()
+            raise
 
     def _load_key(self) -> bytes:
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
