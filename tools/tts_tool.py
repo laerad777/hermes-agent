@@ -2441,23 +2441,11 @@ def _check_kittentts_available() -> bool:
 
 def _default_neutts_ref_audio() -> str:
     """Return path to the bundled default voice reference audio."""
-    try:
-        from hermes_cli.kanban_runtime_snapshot import sealed_resource_path, snapshot_bootstrap_capability
-        if snapshot_bootstrap_capability() is not None:
-            return str(sealed_resource_path("tools/neutts_samples/jo.wav"))
-    except ImportError:
-        pass
     return str(Path(__file__).parent / "neutts_samples" / "jo.wav")
 
 
 def _default_neutts_ref_text() -> str:
     """Return path to the bundled default voice reference transcript."""
-    try:
-        from hermes_cli.kanban_runtime_snapshot import sealed_resource_path, snapshot_bootstrap_capability
-        if snapshot_bootstrap_capability() is not None:
-            return str(sealed_resource_path("tools/neutts_samples/jo.txt"))
-    except ImportError:
-        pass
     return str(Path(__file__).parent / "neutts_samples" / "jo.txt")
 
 
@@ -2471,8 +2459,8 @@ def _generate_neutts(text: str, output_path: str, tts_config: Dict[str, Any]) ->
     import sys
 
     neutts_config = tts_config.get("neutts") or {}
-    ref_audio = neutts_config.get("ref_audio", "")
-    ref_text = neutts_config.get("ref_text", "")
+    ref_audio = neutts_config.get("ref_audio", "") or _default_neutts_ref_audio()
+    ref_text = neutts_config.get("ref_text", "") or _default_neutts_ref_text()
     model = neutts_config.get("model", "neuphonic/neutts-air-q4-gguf")
     device = neutts_config.get("device", "cpu")
 
@@ -2482,41 +2470,18 @@ def _generate_neutts(text: str, output_path: str, tts_config: Dict[str, Any]) ->
     if not output_path.endswith(".wav"):
         wav_path = output_path.rsplit(".", 1)[0] + ".wav"
 
-    from contextlib import ExitStack
+    synth_script = str(Path(__file__).parent / "neutts_synth.py")
+    cmd = [
+        sys.executable, synth_script,
+        "--text", text,
+        "--out", wav_path,
+        "--ref-audio", ref_audio,
+        "--ref-text", ref_text,
+        "--model", model,
+        "--device", device,
+    ]
 
-    pass_fds: tuple[int, ...] = ()
-    with ExitStack() as stack:
-        try:
-            from hermes_cli.kanban_runtime_snapshot import (
-                sealed_python_argv,
-                sealed_resource_file,
-                snapshot_bootstrap_capability,
-            )
-            if snapshot_bootstrap_capability() is not None:
-                command, prefix = sealed_python_argv("tools/neutts_synth.py")
-                if not ref_audio:
-                    audio = stack.enter_context(sealed_resource_file("tools/neutts_samples/jo.wav"))
-                    ref_audio = audio.path
-                    pass_fds += audio.pass_fds
-                if not ref_text:
-                    transcript = stack.enter_context(sealed_resource_file("tools/neutts_samples/jo.txt"))
-                    ref_text = transcript.path
-                    pass_fds += transcript.pass_fds
-            else:
-                command, prefix = sys.executable, [str(Path(__file__).parent / "neutts_synth.py")]
-        except ImportError:
-            command, prefix = sys.executable, [str(Path(__file__).parent / "neutts_synth.py")]
-        ref_audio = ref_audio or _default_neutts_ref_audio()
-        ref_text = ref_text or _default_neutts_ref_text()
-        cmd = [
-            command, *prefix, "--text", text, "--out", wav_path,
-            "--ref-audio", ref_audio, "--ref-text", ref_text,
-            "--model", model, "--device", device,
-        ]
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, encoding='utf-8', errors='replace',
-            timeout=120, stdin=subprocess.DEVNULL, pass_fds=pass_fds,
-        )
+    result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=120, stdin=subprocess.DEVNULL)
     if result.returncode != 0:
         stderr = result.stderr.strip()
         # Filter out the "OK:" line from stderr

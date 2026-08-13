@@ -396,12 +396,6 @@ TOOLSETS = {
         "includes": [],
     },
 
-    "review-exec": {
-        "description": "Allowlisted repository inspection and verification execution for read-only reviewers",
-        "tools": ["review_exec"],
-        "includes": [],
-    },
-
     # Coding posture (base Hermes — CLI/TUI/desktop/ACP). Auto-selected in a
     # code workspace; see agent/coding_context.py. Keeps everything you reach
     # for while pairing on code and drops the rest (messaging, tts, image_gen,

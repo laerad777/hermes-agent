@@ -51,12 +51,8 @@ def _capture_spawn_env(kb, monkeypatch, workspace: str) -> dict:
         captured["cwd"] = kwargs.get("cwd")
         return FakeProc()
 
-    monkeypatch.setattr(
-        kb,
-        "_spawn_posix_generic_worker",
-        lambda _conn, _task, cmd, **kwargs: fake_popen(cmd, **kwargs),
-    )
-    kb._default_spawn(_make_task(kb), workspace, authority_conn=object())  # type: ignore[arg-type]
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    kb._default_spawn(_make_task(kb), workspace)
     return captured
 
 

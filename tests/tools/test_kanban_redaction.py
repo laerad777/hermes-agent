@@ -140,25 +140,3 @@ def test_kanban_complete_result_field_scrubbed(worker_env):
     assert run is not None
     stored = run.summary or run.result if hasattr(run, "result") else run.summary or ""
     assert secret not in (stored or "")
-
-
-def test_kanban_complete_nested_metadata_secret_scrubbed(worker_env):
-    from tools import kanban_tools as kt
-    from hermes_cli import kanban_db as kb
-
-    secret = "ghp_" + "E" * 40
-    metadata = {"nested": {"token": secret}, "safe": ["kept"]}
-
-    out = json.loads(kt._handle_complete({"summary": "done", "metadata": metadata}))
-
-    assert out["ok"] is True
-    assert metadata["nested"]["token"] == secret
-    conn = kb.connect()
-    try:
-        run = kb.latest_run(conn, worker_env)
-        assert run is not None
-        assert run.metadata is not None
-        assert secret not in json.dumps(run.metadata)
-        assert run.metadata["safe"] == ["kept"]
-    finally:
-        conn.close()

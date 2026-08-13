@@ -117,21 +117,21 @@ def test_migration_adds_provider_override_column(conn):
 # ---------------------------------------------------------------------------
 
 
-def _spawn_and_capture(monkeypatch, tmp_path, task, conn):
+def _spawn_and_capture(monkeypatch, tmp_path, task):
     monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
     captured = {}
 
     class FakeProc:
         pid = 4245
 
-    def fake_spawn(conn, task, cmd, **kwargs):
+    def fake_popen(cmd, *args, **kwargs):
         captured["cmd"] = list(cmd)
         return FakeProc()
 
-    monkeypatch.setattr(kb, "_spawn_posix_generic_worker", fake_spawn)
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
     workspace = tmp_path / "ws"
     workspace.mkdir(exist_ok=True)
-    kb._default_spawn(task, str(workspace), authority_conn=conn)
+    kb._default_spawn(task, str(workspace))
     return captured["cmd"]
 
 
@@ -141,7 +141,7 @@ def test_spawn_passes_model_and_provider(monkeypatch, tmp_path, conn):
         model_override="glm-5", provider_override="openrouter",
     )
     task = kb.get_task(conn, tid)
-    cmd = _spawn_and_capture(monkeypatch, tmp_path, task, conn)
+    cmd = _spawn_and_capture(monkeypatch, tmp_path, task)
     i = cmd.index("-m")
     assert cmd[i + 1] == "glm-5"
     j = cmd.index("--provider")
@@ -254,7 +254,7 @@ def test_reasoning_effort_without_a_model_override(conn):
 def test_spawn_passes_reasoning_without_a_model(monkeypatch, tmp_path, conn):
     tid = kb.create_task(conn, title="t", assignee="elias", reasoning_effort="high")
     task = kb.get_task(conn, tid)
-    cmd = _spawn_and_capture(monkeypatch, tmp_path, task, conn)
+    cmd = _spawn_and_capture(monkeypatch, tmp_path, task)
     assert "-m" not in cmd
     i = cmd.index("--reasoning")
     assert cmd[i + 1] == "high"
@@ -263,7 +263,7 @@ def test_spawn_passes_reasoning_without_a_model(monkeypatch, tmp_path, conn):
 def test_spawn_omits_reasoning_when_unset(monkeypatch, tmp_path, conn):
     tid = kb.create_task(conn, title="t", assignee="elias")
     task = kb.get_task(conn, tid)
-    cmd = _spawn_and_capture(monkeypatch, tmp_path, task, conn)
+    cmd = _spawn_and_capture(monkeypatch, tmp_path, task)
     assert "--reasoning" not in cmd
 
 

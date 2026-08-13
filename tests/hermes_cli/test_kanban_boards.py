@@ -275,15 +275,7 @@ class TestWorkerSpawnEnv:
             tenant=None,
         )
 
-        monkeypatch.setattr(
-            kb,
-            "_spawn_posix_generic_worker",
-            lambda _conn, _task, cmd, **kwargs: fake_popen(cmd, **kwargs),
-        )
-        kb._default_spawn(
-            task, str(fresh_home / "ws"), board="spawntest",
-            authority_conn=object(),  # type: ignore[arg-type]
-        )
+        kb._default_spawn(task, str(fresh_home / "ws"), board="spawntest")
 
         env = captured["env"]
         assert env["HERMES_KANBAN_BOARD"] == "spawntest"

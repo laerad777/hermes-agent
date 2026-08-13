@@ -154,19 +154,7 @@ def _load_catalog(lang: str) -> dict[str, str]:
             return cached
 
     path = _locales_dir() / f"{lang}.yaml"
-    try:
-        from hermes_cli.kanban_runtime_snapshot import (
-            sealed_resource_text,
-            snapshot_bootstrap_capability,
-        )
-
-        sealed_text = (
-            sealed_resource_text(f"locales/{lang}.yaml")
-            if snapshot_bootstrap_capability() is not None else None
-        )
-    except ImportError:
-        sealed_text = None
-    if sealed_text is None and not path.is_file():
+    if not path.is_file():
         logger.debug("i18n catalog missing for %s at %s", lang, path)
         with _catalog_lock:
             _catalog_cache[lang] = {}
@@ -174,7 +162,8 @@ def _load_catalog(lang: str) -> dict[str, str]:
 
     try:
         import yaml  # PyYAML is already a hermes dependency
-        raw = yaml.safe_load(sealed_text if sealed_text is not None else path.read_text(encoding="utf-8")) or {}
+        with path.open("r", encoding="utf-8") as f:
+            raw = yaml.safe_load(f) or {}
     except Exception as exc:
         logger.warning("Failed to load i18n catalog %s: %s", path, exc)
         with _catalog_lock:

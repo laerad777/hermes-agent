@@ -57,12 +57,7 @@ def test_worker_spawn_tags_session_source_kanban(monkeypatch, tmp_path):
     workspace = str(tmp_path / "ws")
     os.makedirs(workspace, exist_ok=True)
 
-    monkeypatch.setattr(
-        kb,
-        "_spawn_posix_generic_worker",
-        lambda _conn, _task, cmd, **kwargs: _fake_popen(cmd, **kwargs),
-    )
-    kb._default_spawn(task, workspace, authority_conn=object())  # type: ignore[arg-type]
+    kb._default_spawn(task, workspace)
 
     assert captured["env"]["HERMES_SESSION_SOURCE"] == "kanban"
 

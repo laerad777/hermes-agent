@@ -835,14 +835,7 @@ class TestSharedBoardPaths:
             tenant=None,
             branch_name="wt/t_dispatch_env",
         )
-        monkeypatch.setattr(
-            kb,
-            "_spawn_posix_generic_worker",
-            lambda _conn, _task, cmd, **kwargs: _FakePopen(cmd, **kwargs),
-        )
-        kb._default_spawn(
-            task, str(tmp_path / "ws"), authority_conn=object(),  # type: ignore[arg-type]
-        )
+        kb._default_spawn(task, str(tmp_path / "ws"))
 
         env = captured["env"]
         assert env["HERMES_KANBAN_DB"] == str(default_home / "kanban.db")

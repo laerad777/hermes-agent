@@ -722,15 +722,9 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
         tid = kb.create_task(conn, title="skill-loading test",
                              assignee="some-profile")
         task = kb.get_task(conn, tid)
-        assert task is not None
         workspace = kb.resolve_workspace(task)
-        monkeypatch.setattr(
-            kb,
-            "_spawn_posix_generic_worker",
-            lambda _conn, _task, cmd, **kwargs: fake_popen(cmd, **kwargs),
-        )
-        spawned = kb._default_spawn(task, str(workspace), authority_conn=conn)
-        assert spawned == 99999
+        pid = kb._default_spawn(task, str(workspace))
+        assert pid == 99999
     finally:
         conn.close()
 

@@ -122,17 +122,7 @@ def _repo_npm_range() -> str | None:
     """Return ``engines.npm`` from the checkout's root ``package.json``."""
     package_json = Path(__file__).resolve().parent.parent / "package.json"
     try:
-        from hermes_cli.kanban_runtime_snapshot import (
-            sealed_resource_text,
-            snapshot_bootstrap_capability,
-        )
-
-        text = (
-            sealed_resource_text("package.json")
-            if snapshot_bootstrap_capability() is not None
-            else package_json.read_text(encoding="utf-8")
-        )
-        data = json.loads(text)
+        data = json.loads(package_json.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     engines = data.get("engines")
