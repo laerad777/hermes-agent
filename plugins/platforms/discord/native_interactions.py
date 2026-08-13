@@ -381,13 +381,54 @@ class DiscordNativeInteractionStore:
             os.fsync(fd)
         finally:
             os.close(fd)
+        backup_name = f".{self.db_path.name}.rollback"
+        had_snapshot = False
+        published = False
         try:
+            try:
+                os.rename(
+                    self.db_path.name, backup_name,
+                    src_dir_fd=self._directory_fd,
+                    dst_dir_fd=self._directory_fd,
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                had_snapshot = True
             os.replace(
                 temporary_name, self.db_path.name,
                 src_dir_fd=self._directory_fd,
                 dst_dir_fd=self._directory_fd,
             )
+            published = True
             os.fsync(self._directory_fd)
+            if had_snapshot:
+                os.unlink(backup_name, dir_fd=self._directory_fd)
+                os.fsync(self._directory_fd)
+        except BaseException as publication_error:
+            try:
+                if published:
+                    if had_snapshot:
+                        os.replace(
+                            backup_name, self.db_path.name,
+                            src_dir_fd=self._directory_fd,
+                            dst_dir_fd=self._directory_fd,
+                        )
+                    else:
+                        os.unlink(self.db_path.name, dir_fd=self._directory_fd)
+                elif had_snapshot:
+                    os.replace(
+                        backup_name, self.db_path.name,
+                        src_dir_fd=self._directory_fd,
+                        dst_dir_fd=self._directory_fd,
+                    )
+                os.fsync(self._directory_fd)
+            except BaseException as rollback_error:
+                raise SecureStoreUnavailable("native_snapshot_recovery_required") from ExceptionGroup(
+                    "native snapshot publication and rollback failed",
+                    [publication_error, rollback_error],
+                )
+            raise
         finally:
             try:
                 os.unlink(temporary_name, dir_fd=self._directory_fd)
