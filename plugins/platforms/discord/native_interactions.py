@@ -243,10 +243,23 @@ class DiscordNativeInteractionStore:
         info = self.state_dir.stat()
         if not stat.S_ISDIR(info.st_mode):
             raise OSError("native interaction state path is not a directory")
+        get_euid = getattr(os, "geteuid", None)
+        self._euid = get_euid() if callable(get_euid) else None
+        if self._euid is not None and info.st_uid != self._euid:
+            raise OSError("native interaction state path has an unexpected owner")
         self.key_path = self.state_dir / "signing-key-v1"
         self.db_path = self.state_dir / "native-v1.sqlite3"
         self.key = self._load_key()
+        if self.db_path.is_symlink():
+            raise OSError("native interaction database cannot be a symlink")
         self.connection = sqlite3.connect(self.db_path)
+        db_info = self.db_path.lstat()
+        if not stat.S_ISREG(db_info.st_mode):
+            self.connection.close()
+            raise OSError("native interaction database is not a regular file")
+        if self._euid is not None and db_info.st_uid != self._euid:
+            self.connection.close()
+            raise OSError("native interaction database has an unexpected owner")
         os.chmod(self.db_path, 0o600)
         self.connection.execute("PRAGMA journal_mode=DELETE")
         self.connection.execute("""

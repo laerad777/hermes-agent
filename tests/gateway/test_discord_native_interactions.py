@@ -798,3 +798,14 @@ async def test_native_forum_fallback_discards_native_pending_row(tmp_path):
     assert result.success
     assert result.structured_failure == "unsupported_forum"
     assert adapter._native_interaction_store.discard_pending(handle.delivery) is None
+
+
+def test_native_store_rejects_database_symlink(tmp_path):
+    state_dir = tmp_path / "native"
+    state_dir.mkdir(mode=0o700)
+    target = tmp_path / "attacker.sqlite3"
+    target.write_bytes(b"")
+    (state_dir / "native-v1.sqlite3").symlink_to(target)
+
+    with pytest.raises(OSError, match="database cannot be a symlink"):
+        DiscordNativeInteractionStore(state_dir)
