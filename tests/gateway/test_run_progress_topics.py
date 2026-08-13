@@ -770,6 +770,7 @@ async def _run_with_agent(
         source=source,
         session_id=session_id,
         session_key=session_key,
+        event_message_id="inbound-1",
     )
     return adapter, result
 
@@ -941,6 +942,40 @@ class CanonicalPollStreamAgent:
         }
 
 
+class QueuedCanonicalPollStreamAgent:
+    calls = 0
+
+    def __init__(self, **kwargs):
+        self.stream_delta_callback = kwargs.get("stream_delta_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        type(self).calls += 1
+        if type(self).calls == 1:
+            if self.stream_delta_callback:
+                self.stream_delta_callback("poll summary")
+            # Keep the complete canonical carrier well beyond preview-sized
+            # content so the regression cannot pass with a truncated marker.
+            return {
+                "final_response": "poll summary\n" + _native_carrier(
+                    "poll",
+                    {
+                        "question": "Ship the complete queued delivery? " + "q" * 250,
+                        "answers": [{"text": "Yes"}, {"text": "No"}],
+                        "duration_hours": 24,
+                    },
+                ),
+                "response_previewed": True,
+                "messages": [],
+                "api_calls": 1,
+            }
+        return {
+            "final_response": "follow-up processed",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class FiveToolCanonicalModalStreamAgent:
     """Mirror a real tool-heavy turn before the canonical final carrier."""
 
@@ -1077,6 +1112,44 @@ async def test_canonical_native_carrier_survives_run_agent_completion(
     assert result["delivery_metadata_response"] == expected_body
     assert result["delivery_metadata"]["discord_native_payload"].kind == expected_kind
     assert all("HERMES_DISCORD" not in str(call) for call in adapter.sent + adapter.edits)
+
+
+@pytest.mark.asyncio
+async def test_queued_follow_up_delivers_original_poll_once_with_obligation(
+    monkeypatch, tmp_path
+):
+    QueuedCanonicalPollStreamAgent.calls = 0
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        QueuedCanonicalPollStreamAgent,
+        session_id="sess-queued-canonical-poll",
+        pending_text="process this after the poll",
+        config_data={
+            "display": {"tool_progress": "off", "interim_assistant_messages": False},
+            "streaming": {"enabled": True, "edit_interval": 0.01, "buffer_threshold": 1},
+        },
+        platform=Platform.DISCORD,
+        chat_id="1234",
+        chat_type="group",
+        thread_id="poll-thread",
+        adapter_cls=OutboundMetadataEditProgressCaptureAdapter,
+    )
+
+    assert result["final_response"] == "follow-up processed"
+    assert QueuedCanonicalPollStreamAgent.calls == 2
+    assert len(adapter.retry_sends) == 1
+    poll_send = adapter.retry_sends[0]
+    assert poll_send["content"] == "poll summary"
+    assert poll_send["metadata"]["discord_native_payload"]["kind"] == "poll"
+    assert poll_send["metadata"]["discord_native_payload"]["payload"]["question"].endswith(
+        "q" * 250
+    )
+    assert poll_send["metadata"]["_discord_delivery_obligation_id"] == "turn:inbound-1"
+    assert all(
+        "HERMES_DISCORD_NATIVE" not in str(call)
+        for call in adapter.retry_sends + adapter.sent + adapter.edits
+    )
 
 
 @pytest.mark.asyncio
