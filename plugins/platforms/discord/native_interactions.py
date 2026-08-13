@@ -242,28 +242,33 @@ class DiscordNativeInteractionStore:
     def __init__(self, state_dir: Path) -> None:
         self.state_dir = Path(state_dir)
         self._directory_fd: int | None = None
+        self.connection: sqlite3.Connection | None = None
         self.capability = secure_store_capability()
         if not self.capability.available:
             raise SecureStoreUnavailable(self.capability.reason)
         self._secure = _PosixSecureStorePrimitives(self.capability)
-        self._directory_fd = self._secure.open_directory(self.state_dir, create=True)
-        self._euid = self._secure._euid
-        self.key_path = self.state_dir / "signing-key-v1"
-        self.db_path = self.state_dir / "native-v1.sqlite3"
-        self.recovery_path = self.state_dir / ".native-v1.sqlite3.recovery"
         try:
-            os.stat(
-                self.recovery_path.name,
-                dir_fd=self._directory_fd,
-                follow_symlinks=False,
-            )
-        except FileNotFoundError:
-            pass
-        else:
-            raise SecureStoreUnavailable("native_snapshot_recovery_required")
-        self.key = self._load_key()
-        self.connection = self._connect_database()
-        self.connection.execute("PRAGMA journal_mode=DELETE")
+            self._directory_fd = self._secure.open_directory(self.state_dir, create=True)
+            self._euid = self._secure._euid
+            self.key_path = self.state_dir / "signing-key-v1"
+            self.db_path = self.state_dir / "native-v1.sqlite3"
+            self.recovery_path = self.state_dir / ".native-v1.sqlite3.recovery"
+            try:
+                os.stat(
+                    self.recovery_path.name,
+                    dir_fd=self._directory_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                raise SecureStoreUnavailable("native_snapshot_recovery_required")
+            self.key = self._load_key()
+            self.connection = self._connect_database()
+            self.connection.execute("PRAGMA journal_mode=DELETE")
+        except BaseException:
+            self.close()
+            raise
         self.connection.execute("""
             CREATE TABLE IF NOT EXISTS deliveries(
                 logical_id TEXT UNIQUE NOT NULL,
@@ -427,8 +432,11 @@ class DiscordNativeInteractionStore:
             os.fsync(self._directory_fd)
             if had_snapshot:
                 os.unlink(backup_name, dir_fd=self._directory_fd)
-            os.unlink(recovery_name, dir_fd=self._directory_fd)
-            os.fsync(self._directory_fd)
+            try:
+                os.unlink(recovery_name, dir_fd=self._directory_fd)
+                os.fsync(self._directory_fd)
+            except BaseException as cleanup_error:
+                raise SecureStoreUnavailable("native_snapshot_recovery_required") from cleanup_error
         except BaseException as publication_error:
             try:
                 if published:
