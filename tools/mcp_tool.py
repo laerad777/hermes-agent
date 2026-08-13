@@ -5438,8 +5438,15 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             _mark_proven = getattr(server, "_mark_session_proven", None)
             if _mark_proven is not None:
                 _mark_proven()
-            # MCP CallToolResult has .content (list of content blocks) and .isError
-            if result.isError:
+            # MCP 1.x exposes camelCase Pydantic attributes while MCP 2.x
+            # exposes snake_case attributes with camelCase serialization aliases.
+            # Read both shapes so a dependency drift cannot break every tool call.
+            is_error = getattr(
+                result,
+                "is_error",
+                getattr(result, "isError", False),
+            )
+            if is_error:
                 error_text = ""
                 for block in (result.content or []):
                     if getattr(block, "text", None):
@@ -5508,7 +5515,11 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             # MCP spec: content is model-oriented (text), structuredContent
             # is machine-oriented (JSON metadata).  For an AI agent, content
             # is the primary payload; structuredContent supplements it.
-            structured = getattr(result, "structuredContent", None)
+            structured = getattr(
+                result,
+                "structured_content",
+                getattr(result, "structuredContent", None),
+            )
             if structured is not None:
                 if text_result:
                     return json.dumps({
