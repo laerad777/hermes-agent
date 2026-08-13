@@ -429,12 +429,12 @@ class GatewayStreamConsumer:
             return native.get("kind")
         return getattr(native, "kind", None)
 
-    async def _defer_completed_poll_to_ordinary_delivery(self) -> None:
-        """Clean a streaming preview without acknowledging Poll delivery.
+    async def _defer_completed_native_to_ordinary_delivery(self) -> None:
+        """Clean a streaming preview without acknowledging native delivery.
 
-        Discord Poll creation is send-only.  A successful plain-text edit must
-        therefore never set the stream delivery flags and suppress the ordinary
-        poll path, which owns the authoritative obligation and durable ledger.
+        Poll creation is send-only, while component delivery needs the
+        structured begin/attempt/finalize transaction owned by the ordinary
+        final-send path. A successful preview edit proves neither.
         """
         preview_ids = set(self._preview_message_ids)
         if self._message_id and self._message_id != "__no_edit__":
@@ -935,12 +935,11 @@ class GatewayStreamConsumer:
                         await self._suppress_silence_marker()
                         return
 
-                    # Polls cannot be created by editing an existing Discord
-                    # message.  Defer the complete body+metadata to the normal
-                    # send path instead of accepting a successful text edit as
-                    # structured delivery.
-                    if self._completed_native_kind() == "poll":
-                        await self._defer_completed_poll_to_ordinary_delivery()
+                    # Every native interaction is authoritative only through
+                    # ordinary structured delivery: Polls are send-only, while
+                    # components need durable pending state plus message bind.
+                    if self._completed_native_kind() is not None:
+                        await self._defer_completed_native_to_ordinary_delivery()
                         self._final_response_sent = False
                         self._final_content_delivered = False
                         self._delivered_final_text = None

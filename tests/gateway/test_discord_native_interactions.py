@@ -92,6 +92,52 @@ def test_fixed_route_matrix():
 
 
 @pytest.mark.asyncio
+async def test_streamed_modal_defers_to_structured_send_and_binds(tmp_path, monkeypatch):
+    from plugins.platforms.discord import adapter as discord_adapter
+
+    monkeypatch.setattr(discord_adapter, "discord", _fake_discord())
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="fake"))
+    store = DiscordNativeInteractionStore(tmp_path)
+    adapter._native_interaction_store = store
+    preview = SimpleNamespace(id=9, edit=AsyncMock())
+    final_message = SimpleNamespace(id=10)
+    channel = SimpleNamespace(
+        id=8, guild=SimpleNamespace(id=7),
+        send=AsyncMock(side_effect=[preview, final_message]),
+        get_partial_message=lambda _message_id: preview,
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _id: channel,
+        fetch_channel=AsyncMock(return_value=channel),
+    )
+    payload = validate_discord_native_payload("modal", {
+        "title": "E2E", "trigger_label": "Open", "ttl_seconds": 60,
+        "inputs": [{"id": "note", "label": "Note", "style": "short"}],
+    })
+    payload = type(payload)(payload.kind, payload.payload, "42")
+    consumer = GatewayStreamConsumer(
+        adapter, "8", StreamConsumerConfig(edit_interval=0.0, buffer_threshold=1),
+    )
+    task = asyncio.create_task(consumer.run())
+    consumer.on_delta("summary")
+    await asyncio.sleep(0.1)
+    assert consumer.complete("summary", {"discord_native_payload": payload})
+    await asyncio.wait_for(task, 2)
+
+    assert consumer.final_response_sent is False
+    assert consumer.final_content_delivered is False
+    preview.edit.assert_awaited_once_with(content="…")
+
+    sent = await adapter._send_with_retry(
+        "8", "summary", metadata={"discord_native_payload": payload},
+    )
+    assert sent.success
+    assert channel.send.await_count == 2
+    assert channel.send.await_args_list[-1].kwargs.get("view") is not None
+    assert len(store.restore_active_deliveries()) == 1
+
+
+@pytest.mark.asyncio
 async def test_adapter_poll_uses_one_native_send_and_allowed_mentions_none(monkeypatch):
     from plugins.platforms.discord import adapter as discord_adapter
 
