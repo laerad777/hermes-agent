@@ -807,7 +807,7 @@ def test_native_store_rejects_database_symlink(tmp_path):
     target.write_bytes(b"")
     (state_dir / "native-v1.sqlite3").symlink_to(target)
 
-    with pytest.raises(OSError, match="database cannot be a symlink"):
+    with pytest.raises(OSError):
         DiscordNativeInteractionStore(state_dir)
 
 

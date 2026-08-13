@@ -10,7 +10,6 @@ import re
 import secrets
 import sqlite3
 import stat
-import sys
 import time
 import unicodedata
 from dataclasses import dataclass
@@ -21,6 +20,11 @@ from gateway.discord_native import (
     DiscordNativePayloadV1,
     discord_native_to_mapping,
     validate_discord_native_payload,
+)
+from plugins.platforms.discord.product_details import (
+    SecureStoreUnavailable,
+    _PosixSecureStorePrimitives,
+    secure_store_capability,
 )
 
 _COMPONENT_KINDS = frozenset({
@@ -238,17 +242,12 @@ class DiscordNativeInteractionStore:
     def __init__(self, state_dir: Path) -> None:
         self.state_dir = Path(state_dir)
         self._directory_fd: int | None = None
-        self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        if self.state_dir.is_symlink():
-            raise OSError("native interaction state path cannot be a symlink")
-        os.chmod(self.state_dir, 0o700)
-        info = self.state_dir.stat()
-        if not stat.S_ISDIR(info.st_mode):
-            raise OSError("native interaction state path is not a directory")
-        get_euid = getattr(os, "geteuid", None)
-        self._euid = get_euid() if callable(get_euid) else None
-        if self._euid is not None and info.st_uid != self._euid:
-            raise OSError("native interaction state path has an unexpected owner")
+        self.capability = secure_store_capability()
+        if not self.capability.available:
+            raise SecureStoreUnavailable(self.capability.reason)
+        self._secure = _PosixSecureStorePrimitives(self.capability)
+        self._directory_fd = self._secure.open_directory(self.state_dir, create=True)
+        self._euid = self._secure._euid
         self.key_path = self.state_dir / "signing-key-v1"
         self.db_path = self.state_dir / "native-v1.sqlite3"
         self.key = self._load_key()
@@ -304,59 +303,114 @@ class DiscordNativeInteractionStore:
                     UNIQUE(target_hash, obligation_hash)
                 )
             """)
-        self.connection.commit()
+        self._commit()
         self.maintain()
 
     def _connect_database(self) -> sqlite3.Connection:
-        """Open the native ledger through a directory-fd bound path on Linux."""
-        if sys.platform.startswith("linux") and Path("/proc/self/fd").is_dir():
-            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-            directory_fd = os.open(self.state_dir, flags)
+        """Open a proc-fd database or a verified macOS snapshot."""
+        if self._directory_fd is None:
+            raise SecureStoreUnavailable("native interaction state store is closed")
+        if self.capability.backend == "darwin-snapshot":
+            connection = sqlite3.connect(":memory:", check_same_thread=False)
             try:
-                directory_info = os.fstat(directory_fd)
-                if not stat.S_ISDIR(directory_info.st_mode):
-                    raise OSError("native interaction state path is not a directory")
-                if self._euid is not None and directory_info.st_uid != self._euid:
-                    raise OSError("native interaction state path has an unexpected owner")
-                anchored = f"/proc/self/fd/{directory_fd}/{self.db_path.name}"
-                connection = sqlite3.connect(f"file:{anchored}?nofollow=1", uri=True)
-                file_info = os.stat(self.db_path.name, dir_fd=directory_fd, follow_symlinks=False)
-                if not stat.S_ISREG(file_info.st_mode):
-                    connection.close()
-                    raise OSError("native interaction database is not a regular file")
-                if self._euid is not None and file_info.st_uid != self._euid:
-                    connection.close()
-                    raise OSError("native interaction database has an unexpected owner")
-                os.chmod(self.db_path.name, 0o600, dir_fd=directory_fd, follow_symlinks=False)
-                self._directory_fd = directory_fd
+                fd = os.open(
+                    self.db_path.name,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=self._directory_fd,
+                )
+            except FileNotFoundError:
                 return connection
-            except Exception:
-                os.close(directory_fd)
+            try:
+                info = self._secure.validate_owned_regular_fd(
+                    fd, label="Discord native interaction snapshot",
+                )
+                if stat.S_IMODE(info.st_mode) != 0o600 or info.st_size > 8 * 1024 * 1024:
+                    raise OSError("native interaction snapshot has invalid metadata")
+                data = bytearray()
+                while len(data) < info.st_size:
+                    chunk = os.read(fd, min(1024 * 1024, info.st_size - len(data)))
+                    if not chunk:
+                        raise OSError("native interaction snapshot was truncated")
+                    data.extend(chunk)
+                if data:
+                    connection.deserialize(bytes(data))
+                return connection
+            except BaseException:
+                connection.close()
                 raise
-
-        if self.db_path.is_symlink():
-            raise OSError("native interaction database cannot be a symlink")
-        connection = sqlite3.connect(self.db_path)
-        db_info = self.db_path.lstat()
-        if not stat.S_ISREG(db_info.st_mode):
+            finally:
+                os.close(fd)
+        if self.capability.backend != "linux-procfd":
+            raise SecureStoreUnavailable("secure native interaction backend unavailable")
+        anchored = f"/proc/self/fd/{self._directory_fd}/{self.db_path.name}"
+        connection = sqlite3.connect(f"file:{anchored}?nofollow=1", uri=True)
+        file_info = os.stat(
+            self.db_path.name,
+            dir_fd=self._directory_fd,
+            follow_symlinks=False,
+        )
+        if not stat.S_ISREG(file_info.st_mode) or file_info.st_uid != self._euid:
             connection.close()
-            raise OSError("native interaction database is not a regular file")
-        if self._euid is not None and db_info.st_uid != self._euid:
-            connection.close()
-            raise OSError("native interaction database has an unexpected owner")
-        os.chmod(self.db_path, 0o600)
+            raise OSError("native interaction database has invalid metadata")
+        os.chmod(
+            self.db_path.name, 0o600,
+            dir_fd=self._directory_fd, follow_symlinks=False,
+        )
         return connection
+
+    def _commit(self) -> None:
+        self.connection.commit()
+        if self.capability.backend != "darwin-snapshot":
+            return
+        if self._directory_fd is None:
+            raise SecureStoreUnavailable("native interaction state store is closed")
+        data = self.connection.serialize()
+        temporary_name = f".{self.db_path.name}.{secrets.token_hex(8)}.tmp"
+        fd = os.open(
+            temporary_name,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=self._directory_fd,
+        )
+        try:
+            self._secure.validate_owned_regular_fd(
+                fd, label="Discord native interaction temporary snapshot",
+            )
+            view = memoryview(data)
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise OSError("failed to write native interaction snapshot")
+                view = view[written:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        try:
+            os.replace(
+                temporary_name, self.db_path.name,
+                src_dir_fd=self._directory_fd,
+                dst_dir_fd=self._directory_fd,
+            )
+            os.fsync(self._directory_fd)
+        finally:
+            try:
+                os.unlink(temporary_name, dir_fd=self._directory_fd)
+            except FileNotFoundError:
+                pass
 
     def _load_key(self) -> bytes:
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        if self._directory_fd is None:
+            raise SecureStoreUnavailable("native interaction state store is closed")
         try:
-            fd = os.open(self.key_path, flags)
+            fd = os.open(self.key_path.name, flags, dir_fd=self._directory_fd)
         except FileNotFoundError:
             key = secrets.token_bytes(32)
             fd = os.open(
-                self.key_path,
+                self.key_path.name,
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
                 0o600,
+                dir_fd=self._directory_fd,
             )
             try:
                 os.write(fd, key)
@@ -416,7 +470,7 @@ class DiscordNativeInteractionStore:
                 str(channel_id), None, expires_at, "pending",
             ),
         )
-        self.connection.commit()
+        self._commit()
         return NativeInteractionDelivery(
             str(logical_id), delivery_id, (self._custom_id(delivery_id, expires_at),), expires_at
         )
@@ -427,7 +481,7 @@ class DiscordNativeInteractionStore:
             "WHERE delivery_id=? AND state='pending' AND expires_at>?",
             (str(message_id), delivery.delivery_id, int(time.time())),
         )
-        self.connection.commit()
+        self._commit()
         return cursor.rowcount == 1
 
     def resolve(
@@ -490,13 +544,13 @@ class DiscordNativeInteractionStore:
         self.connection.execute(
             "DELETE FROM deliveries WHERE delivery_id=? AND state='pending'", (delivery.delivery_id,)
         )
-        self.connection.commit()
+        self._commit()
 
     def discard_delivery(self, delivery: NativeInteractionDelivery) -> None:
         self.connection.execute(
             "DELETE FROM deliveries WHERE delivery_id=?", (delivery.delivery_id,)
         )
-        self.connection.commit()
+        self._commit()
 
     def claim_poll(
         self, logical_id: str, target_hash: str, obligation_hash: str, payload_hash: str,
@@ -519,7 +573,7 @@ class DiscordNativeInteractionStore:
                 str(payload_hash), current, current,
             ),
         )
-        self.connection.commit()
+        self._commit()
         return cursor.rowcount == 1
 
     def finish_poll(
@@ -537,7 +591,7 @@ class DiscordNativeInteractionStore:
             "WHERE logical_id=? AND state='claimed'",
             (state, message_id, error_class, time.time(), str(logical_id)),
         )
-        self.connection.commit()
+        self._commit()
 
     def poll_delivery(self, logical_id: str) -> dict[str, Any] | None:
         row = self.connection.execute(
@@ -551,7 +605,7 @@ class DiscordNativeInteractionStore:
 
     def maintain(self) -> None:
         self.connection.execute("DELETE FROM deliveries WHERE expires_at<=?", (int(time.time()),))
-        self.connection.commit()
+        self._commit()
 
     def close(self) -> None:
         connection = getattr(self, "connection", None)
