@@ -31,6 +31,15 @@ class _FakeCallToolResult:
         self.structuredContent = structuredContent
 
 
+class _FakeCallToolResultV2:
+    """MCP 2.x result shape, whose Python attributes use snake_case."""
+
+    def __init__(self, content, is_error=False, structured_content=None):
+        self.content = content
+        self.is_error = is_error
+        self.structured_content = structured_content
+
+
 def _fake_run_on_mcp_loop(coro_or_factory, timeout=30):
     coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
     """Run an MCP coroutine directly in a fresh event loop."""
@@ -107,3 +116,34 @@ class TestStructuredContentPreservation:
         raw = handler({})
         data = json.loads(raw)
         assert data["result"] == payload
+
+    def test_v2_snake_case_structured_content(self, _patch_mcp_server):
+        """MCP 2.x snake_case result attributes preserve structured output."""
+        session = _patch_mcp_server
+        payload = {"status": "ok", "sessions": ["session-1"]}
+        session.call_tool = AsyncMock(
+            return_value=_FakeCallToolResultV2(
+                content=[_FakeContentBlock("listed")],
+                structured_content=payload,
+            )
+        )
+        handler = mcp_tool._make_tool_handler("test-server", "my-tool", 30.0)
+        raw = handler({})
+        assert json.loads(raw) == {
+            "result": "listed",
+            "structuredContent": payload,
+        }
+
+    def test_v2_snake_case_error_result(self, _patch_mcp_server):
+        """MCP 2.x snake_case error flag returns the normal sanitized error."""
+        session = _patch_mcp_server
+        session.call_tool = AsyncMock(
+            return_value=_FakeCallToolResultV2(
+                content=[_FakeContentBlock("coordinator failed")],
+                is_error=True,
+            )
+        )
+        handler = mcp_tool._make_tool_handler("test-server", "my-tool", 30.0)
+        raw = handler({})
+        data = json.loads(raw)
+        assert data["error"] == "coordinator failed"
