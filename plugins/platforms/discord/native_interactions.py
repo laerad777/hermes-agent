@@ -348,17 +348,34 @@ class DiscordNativeInteractionStore:
         return connection
 
     def _load_key(self) -> bytes:
-        if self.key_path.exists():
-            if self.key_path.is_symlink():
-                raise OSError("signing key cannot be a symlink")
-            return self.key_path.read_bytes()
-        key = secrets.token_bytes(32)
-        fd = os.open(self.key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
         try:
-            os.write(fd, key)
+            fd = os.open(self.key_path, flags)
+        except FileNotFoundError:
+            key = secrets.token_bytes(32)
+            fd = os.open(
+                self.key_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            try:
+                os.write(fd, key)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            return key
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise OSError("signing key is not a regular file")
+            if self._euid is not None and info.st_uid != self._euid:
+                raise OSError("signing key has an unexpected owner")
+            key = os.read(fd, 33)
+            if len(key) != 32:
+                raise OSError("signing key has an invalid length")
+            return key
         finally:
             os.close(fd)
-        return key
 
     def _custom_id(self, delivery_id: str, expires_at: int) -> str:
         body = f"hni1.{delivery_id}.{expires_at}"

@@ -811,6 +811,17 @@ def test_native_store_rejects_database_symlink(tmp_path):
         DiscordNativeInteractionStore(state_dir)
 
 
+def test_native_store_rejects_signing_key_symlink(tmp_path):
+    state_dir = tmp_path / "native"
+    state_dir.mkdir(mode=0o700)
+    target = tmp_path / "attacker-key"
+    target.write_bytes(b"k" * 32)
+    (state_dir / "signing-key-v1").symlink_to(target)
+
+    with pytest.raises(OSError):
+        DiscordNativeInteractionStore(state_dir)
+
+
 def test_native_store_closes_directory_fd(tmp_path):
     store = DiscordNativeInteractionStore(tmp_path)
     directory_fd = store._directory_fd
