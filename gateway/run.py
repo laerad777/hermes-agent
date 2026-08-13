@@ -27362,6 +27362,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     first_response,
                                     metadata=_queued_metadata,
                                 )
+                                await self._deliver_queued_first_response(
+                                    first_response,
+                                    source=source,
+                                    adapter=adapter,
+                                    metadata=_status_thread_metadata,
+                                    event_message_id=event_message_id,
+                                    text_already_delivered=True,
+                                    deliver_media=not _delivery_result.get("failed"),
+                                )
                             else:
                                 if _already_streamed:
                                     logger.info(
