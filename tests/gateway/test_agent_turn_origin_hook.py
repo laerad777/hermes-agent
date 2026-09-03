@@ -1,6 +1,8 @@
 """Generic lifecycle observer contracts on the current upstream gateway."""
 
 from pathlib import Path
+import ast
+import textwrap
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -126,6 +128,44 @@ def test_hot_path_observer_hooks_are_timeout_bounded():
     from hermes_cli.plugins import _HOOK_TIMEOUT_BOUNDED_HOOKS
 
     assert {"on_agent_turn_origin", "on_delivery_result"} <= _HOOK_TIMEOUT_BOUNDED_HOOKS
+
+
+def test_compression_exhausted_reset_emits_existing_boundary_hook():
+    import gateway.run as gateway_run
+
+    source = Path(gateway_run.__file__).read_text()
+    start = source.index('elif agent_result.get("compression_exhausted")')
+    end = source.index("\n                response =", start)
+    block = source[start:end]
+    block = "if" + block[len("elif"):]
+    tree = ast.parse(textwrap.dedent(block))
+    hook_calls = []
+    for call in ast.walk(tree):
+        if not isinstance(call, ast.Call) or not call.args:
+            continue
+        value = call.args[0]
+        if isinstance(value, ast.Constant) and value.value == "on_session_reset":
+            hook_calls.append(call)
+    assert hook_calls
+    keywords = {keyword.arg for keyword in hook_calls[0].keywords}
+    assert {"old_session_id", "new_session_id", "reason"} <= keywords
+
+
+def test_async_observer_callback_is_closed_not_leaked():
+    async def accidental_async_hook(**_kwargs):
+        return {"context": "must not leak"}
+
+    runner = _runner()
+    with patch("hermes_cli.lifecycle.invoke_hook") as invoke:
+        invoke.return_value = [accidental_async_hook()]
+        assert emit_once(
+            runner,
+            "on_agent_turn_origin",
+            session_key="async",
+            run_generation=1,
+            turn_id="turn",
+            event_kind="agent_turn_origin",
+        ) == []
 
 
 def test_context_contributions_are_bounded():

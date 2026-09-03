@@ -23639,6 +23639,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         self._sync_telegram_topic_binding,
                         source, session_entry, reason="compression-exhausted-reset",
                     )
+                    try:
+                        from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+
+                        _invoke_hook(
+                            "on_session_reset",
+                            session_id=new_entry.session_id,
+                            platform=source.platform.value if source.platform else "",
+                            reason="compression_exhausted",
+                            old_session_id=getattr(new_entry, "prev_session_id", None),
+                            new_session_id=new_entry.session_id,
+                            profile=getattr(source, "profile", None) or "default",
+                            route_profile=getattr(source, "profile", None) or "default",
+                            chat_id=source.chat_id,
+                            chat_type=source.chat_type,
+                            thread_id=source.thread_id,
+                            parent_chat_id=source.parent_chat_id,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Compression-reset lifecycle hook failed",
+                            exc_info=True,
+                        )
                 response = (response or "") + (
                     "\n\n🔄 Session auto-reset — the conversation exceeded the "
                     "maximum context size and could not be compressed further. "

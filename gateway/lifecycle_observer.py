@@ -7,6 +7,7 @@ contract and cannot alter delivery.
 
 from __future__ import annotations
 
+import inspect
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -142,7 +143,20 @@ def emit_once(
     try:
         from hermes_cli.lifecycle import invoke_hook
 
-        return invoke_hook(hook_name, **event)
+        results = invoke_hook(hook_name, **event)
+        # Plugin hooks are a synchronous contract. A callback accidentally
+        # declared async returns a coroutine object from the sync dispatcher;
+        # close it here so an observer cannot leak an unawaited coroutine into
+        # the gateway event loop. Async work must be scheduled by the plugin.
+        bounded_results = []
+        for result in results:
+            if inspect.isawaitable(result):
+                close = getattr(result, "close", None)
+                if callable(close):
+                    close()
+                continue
+            bounded_results.append(result)
+        return bounded_results
     except Exception:
         return []
 
