@@ -220,6 +220,11 @@ VALID_HOOKS: Set[str] = {
     "on_session_end",
     "on_session_finalize",
     "on_session_reset",
+    # Product-neutral gateway observer hooks. Payloads are bounded routing,
+    # session, turn, and terminal-delivery facts; observers cannot alter
+    # dispatch or delivery.
+    "on_agent_turn_origin",
+    "on_delivery_result",
     # Successful skill lifecycle facts. The local skill name is available to
     # plugins, while built-in shared metrics emit only bounded classifications.
     "on_skill_lifecycle",
@@ -436,6 +441,8 @@ _HOOK_TIMEOUT_BOUNDED_HOOKS: Set[str] = {
     "pre_verify",
     "on_session_start",
     "on_session_end",
+    "on_agent_turn_origin",
+    "on_delivery_result",
 }
 
 # Policy hooks: timeout / still-running must fail closed (block the tool).

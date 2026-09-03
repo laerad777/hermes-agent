@@ -71,6 +71,17 @@ class TestResetSessionStampsFreshReset:
         assert new_entry is not None
         assert new_entry.is_fresh_reset is True
 
+    def test_reset_session_records_replaced_session_id(self, tmp_path):
+        store = _make_store(tmp_path)
+        source = _make_source()
+        old_entry = store.get_or_create_session(source)
+        session_key = store._generate_session_key(source)
+
+        new_entry = store.reset_session(session_key)
+
+        assert new_entry is not None
+        assert new_entry.prev_session_id == old_entry.session_id
+
 
 # ---------------------------------------------------------------------------
 # Core regression: _is_new_session stays True after updated_at bump

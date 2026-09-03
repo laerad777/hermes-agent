@@ -343,6 +343,12 @@ class GatewaySlashCommandsMixin:
                 reason="new_session",
                 old_session_id=_old_sid,
                 new_session_id=_new_sid,
+                profile=getattr(source, "profile", None),
+                route_profile=getattr(source, "profile", None),
+                chat_id=getattr(source, "chat_id", None),
+                chat_type=getattr(source, "chat_type", None),
+                thread_id=getattr(source, "thread_id", None),
+                parent_chat_id=getattr(source, "parent_chat_id", None),
             )
         except Exception:
             pass

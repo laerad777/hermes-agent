@@ -68,6 +68,10 @@ class TestPrevSessionIdCapture:
         assert entry2.was_auto_reset is True
         assert entry2.reset_had_activity is True
         assert entry2.prev_session_id == entry1.session_id
+        # Observer boundary lineage reads the durable SessionEntry field rather
+        # than deriving lineage from channel content or other metadata.
+        restored = SessionEntry.from_dict(entry2.to_dict())
+        assert restored.prev_session_id == entry1.session_id
 
 
 # ---------------------------------------------------------------------------

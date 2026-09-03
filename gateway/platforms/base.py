@@ -7031,7 +7031,9 @@ class BasePlatformAdapter(ABC):
                             metadata=_final_thread_metadata,
                             human_delay=human_delay,
                         )
+                        _record_delivery(SendResult(success=True))
                     except Exception as batch_err:
+                        _record_delivery(SendResult(success=False, error=str(batch_err)))
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
 
 
@@ -7073,7 +7075,9 @@ class BasePlatformAdapter(ABC):
                             metadata=_final_thread_metadata,
                             human_delay=human_delay,
                         )
+                        _record_delivery(SendResult(success=True))
                     except Exception as batch_err:
+                        _record_delivery(SendResult(success=False, error=str(batch_err)))
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
 
                 if _non_image_media:
@@ -7113,6 +7117,7 @@ class BasePlatformAdapter(ABC):
                                 metadata=_final_thread_metadata,
                             )
 
+                        _record_delivery(media_result)
                         if not media_result.success:
                             logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, media_result.error)
                             await self._notify_media_delivery_failure(
@@ -7122,6 +7127,7 @@ class BasePlatformAdapter(ABC):
                                 metadata=_final_thread_metadata,
                             )
                     except Exception as media_err:
+                        _record_delivery(SendResult(success=False, error=str(media_err)))
                         logger.warning("[%s] Error sending media: %s", self.name, media_err)
 
                 # Send auto-detected local non-image files as native attachments
@@ -7142,6 +7148,7 @@ class BasePlatformAdapter(ABC):
                                 file_path=file_path,
                                 metadata=_final_thread_metadata,
                             )
+                        _record_delivery(file_result)
                         if not file_result.success:
                             logger.warning(
                                 "[%s] Failed to send local file (%s): %s",
@@ -7155,6 +7162,7 @@ class BasePlatformAdapter(ABC):
                                 metadata=_final_thread_metadata,
                             )
                     except Exception as file_err:
+                        _record_delivery(SendResult(success=False, error=str(file_err)))
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
 
                 # A3 (#29346): if a non-empty response produced nothing
@@ -7173,6 +7181,31 @@ class BasePlatformAdapter(ABC):
 
             # Determine overall success for the processing hook
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
+            # One terminal observation for the logical response, after all
+            # ordinary delivery attempts have settled. Streaming reports via
+            # its consumer callback; the stable event key deduplicates both.
+            try:
+                from gateway.lifecycle_observer import DeliveryResult, observe_runner_delivery
+
+                runner = getattr(self, "gateway_runner", None)
+                # Streaming reports its own terminal outcome from the consumer.
+                # A deliberately silent response has no delivery fact at all.
+                if runner is not None and delivery_attempted:
+                    active = self._active_sessions.get(session_key)
+                    await observe_runner_delivery(
+                        runner,
+                        DeliveryResult(
+                            delivery_succeeded,
+                            "certain" if delivery_succeeded else "uncertain",
+                            "" if delivery_succeeded else "terminal_not_delivered",
+                        ),
+                        source=event.source,
+                        session_key=session_key,
+                        run_generation=getattr(active, "_hermes_run_generation", None),
+                        turn_id=str(getattr(event, "message_id", None) or session_key),
+                    )
+            except Exception:
+                logger.warning("[%s] Delivery observer failed", self.name, exc_info=True)
             # Clean up the per-turn streaming-TTS flag (#60671).
             self._streaming_tts_completed_turns.discard(
                 self._streaming_tts_turn_key(

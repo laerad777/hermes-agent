@@ -6057,6 +6057,16 @@ class TurnRunner:
                             else None
                         ),
                         on_before_finalize=_pause_typing_before_finalize,
+                        on_terminal_delivery=lambda result: __import__(
+                            "gateway.lifecycle_observer", fromlist=["observe_runner_delivery"]
+                        ).observe_runner_delivery(
+                            self._runner,
+                            result,
+                            source=ctx.source,
+                            session_key=ctx.session_key,
+                            run_generation=ctx.run_generation,
+                            turn_id=str(ctx.event_message_id or ctx.session_key),
+                        ),
                         initial_reply_to_id=ctx.event_message_id,
                         run_still_current=ctx._run_still_current,
                     )
@@ -21389,6 +21399,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # compaction summaries. Mirrors /reset and the compression-exhausted
             # path (#9893). Covers daily/idle/suspended auto-reset.
             self._evict_cached_agent(session_key)
+            # Reuse the existing plugin boundary hook instead of introducing a
+            # second reset API. The plugin receives only bounded route/session
+            # identity; continuity policy and persistence remain external.
+            try:
+                from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+
+                _invoke_hook(
+                    "on_session_reset",
+                    session_id=session_entry.session_id,
+                    platform=source.platform.value if source.platform else "",
+                    reason=getattr(session_entry, "auto_reset_reason", None) or "idle",
+                    old_session_id=getattr(session_entry, "prev_session_id", None),
+                    new_session_id=session_entry.session_id,
+                    profile=getattr(source, "profile", None),
+                    route_profile=getattr(source, "profile", None),
+                    chat_id=getattr(source, "chat_id", None),
+                    chat_type=getattr(source, "chat_type", None),
+                    thread_id=getattr(source, "thread_id", None),
+                    parent_chat_id=getattr(source, "parent_chat_id", None),
+                )
+            except Exception:
+                logger.warning("Automatic reset observer failed", exc_info=True)
             session_entry.was_auto_reset = False
         
         # Emit session:start for new or auto-reset sessions
@@ -23113,6 +23145,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         if message_text is None:
             return
+
+        # This is the narrow observation boundary that pre_gateway_dispatch
+        # cannot provide: queued/internal/resumed turns re-enter below inbound
+        # dispatch. Keep product policy in plugins; core emits only bounded
+        # route/session identity and accepts a bounded turn-local sidecar note.
+        try:
+            from gateway.lifecycle_observer import observe_origin
+
+            _origin_kind = "normal"
+            if getattr(event, "internal", False):
+                _origin_kind = "internal_handoff"
+            elif getattr(event, "_hermes_startup_restore_replay", False) or getattr(
+                session_entry, "resume_pending", False
+            ):
+                _origin_kind = "resume"
+            elif history and isinstance(history[-1], dict) and history[-1].get("role") == "tool":
+                _origin_kind = "leftover_drain"
+            turn_sidecar_notes.extend(
+                observe_origin(
+                    self,
+                    source=source,
+                    session_key=session_key,
+                    session_id=session_entry.session_id,
+                    lineage_parent_session_id=getattr(session_entry, "prev_session_id", None),
+                    run_generation=run_generation,
+                    turn_id=str(getattr(event, "message_id", None) or f"generation:{run_generation}"),
+                    origin=_origin_kind,
+                )
+            )
+        except Exception:
+            logger.warning("Gateway turn-origin observer failed", exc_info=True)
 
         # Capture the platform event time as message metadata and keep the
         # persisted transcript clean (strip any leading timestamp prefix).
@@ -30982,6 +31045,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         config=_consumer_cfg,
                         metadata=_thread_metadata,
                         on_before_finalize=_pause_typing_before_finalize,
+                        on_terminal_delivery=lambda result: __import__(
+                            "gateway.lifecycle_observer", fromlist=["observe_runner_delivery"]
+                        ).observe_runner_delivery(
+                            self,
+                            result,
+                            source=source,
+                            session_key=session_key,
+                            run_generation=run_generation,
+                            turn_id=str(event_message_id or session_key),
+                        ),
                         initial_reply_to_id=event_message_id,
                         run_still_current=_run_still_current,
                     )
@@ -31160,6 +31233,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         multiplexing is off this is a transparent pass-through — zero behavior
         change for single-profile gateways.
         """
+        # Recursive queued/interrupt turns enter here without returning through
+        # inbound dispatch. Emit the generic origin fact at their actual
+        # admission point and stage any bounded plugin context for this turn.
+        if _interrupt_depth:
+            try:
+                from gateway.lifecycle_observer import observe_origin
+
+                entry = await self.async_session_store.lookup_by_session_key(session_key)
+                origin_notes = observe_origin(
+                    self,
+                    source=source,
+                    session_key=session_key,
+                    session_id=session_id,
+                    lineage_parent_session_id=getattr(entry, "prev_session_id", None),
+                    run_generation=run_generation,
+                    turn_id=str(event_message_id or f"queued:{_interrupt_depth}"),
+                    origin="interrupt" if bool(getattr(source, "interrupted", False)) else "queued",
+                )
+                if origin_notes:
+                    self._set_pending_turn_sidecar_notes(session_key, origin_notes)
+            except Exception:
+                logger.warning("Queued turn-origin observer failed", exc_info=True)
         if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
             return await self._run_agent_inner(
                 message, context_prompt, history, source, session_id,
