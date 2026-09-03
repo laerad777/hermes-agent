@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter
+from gateway.platforms.base import DeliveryResult
 from gateway.platforms.base import _custom_unit_to_cp
 from gateway.platforms.base import MEDIA_TAG_CLEANUP_RE
 from gateway.config import (
@@ -198,6 +199,7 @@ class GatewayStreamConsumer:
         metadata: Optional[dict] = None,
         on_new_message: Optional[callable] = None,
         on_before_finalize: Optional[Callable[[], Any]] = None,
+        on_terminal_delivery: Optional[Callable[[DeliveryResult], Any]] = None,
         initial_reply_to_id: Optional[str] = None,
         run_still_current: Optional[Callable[[], bool]] = None,
         filter_discord_product_details: bool = False,
@@ -218,6 +220,10 @@ class GatewayStreamConsumer:
         # Gateway callers use this to pause typing refreshes before a slow
         # final rich-text edit (Telegram MarkdownV2 finalize, etc.).
         self._on_before_finalize = on_before_finalize
+        # One terminal observer owns the streamed response as a whole. Preview
+        # sends/edits are ordinary streaming frames, not completed delivery.
+        self._on_terminal_delivery = on_terminal_delivery
+        self._terminal_delivery_notified = False
         self._initial_reply_to_id = initial_reply_to_id
         self._queue: queue.Queue = queue.Queue()
         self._terminal_lock = threading.Lock()
@@ -390,6 +396,20 @@ class GatewayStreamConsumer:
                 await result
         except Exception:
             pass
+
+    async def _notify_terminal_delivery(self, result: DeliveryResult) -> None:
+        """Report one typed outcome for the completed streamed response."""
+        if self._terminal_delivery_notified:
+            return
+        self._terminal_delivery_notified = True
+        if self._on_terminal_delivery is None:
+            return
+        try:
+            callback_result = self._on_terminal_delivery(result)
+            if inspect.isawaitable(callback_result):
+                await callback_result
+        except Exception:
+            logger.warning("Stream terminal delivery observer failed", exc_info=True)
 
     async def _edit_message(
         self,
@@ -858,6 +878,10 @@ class GatewayStreamConsumer:
                 self.chat_id, self._draft_id,
             )
 
+        # ``finally`` reports the terminal outcome even when the first
+        # run-current check returns before entering the queue-drain loop.
+        _cancelled = False
+        _failed = False
         try:
             while True:
                 # Abandon the stream early if the session has been reset
@@ -1249,6 +1273,7 @@ class GatewayStreamConsumer:
                 await asyncio.sleep(0.05)  # Small yield to not busy-loop
 
         except asyncio.CancelledError:
+            _cancelled = True
             # Best-effort final edit on cancellation.  finalize=True so
             # REQUIRES_EDIT_FINALIZE platforms (Telegram) apply final
             # formatting — a plain edit here would leave the entire reply
@@ -1278,6 +1303,7 @@ class GatewayStreamConsumer:
                 self._final_content_delivered = True
                 self._record_turn_final_payload(self._accumulated)
         except Exception as e:
+            _failed = True
             logger.error("Stream consumer error: %s", e)
         finally:
             # Safety net: if run() exits (normal return, cancellation, or
@@ -1299,6 +1325,20 @@ class GatewayStreamConsumer:
                 pass
             except Exception:
                 pass
+            if self._final_response_sent or self._final_content_delivered:
+                await self._notify_terminal_delivery(DeliveryResult(True, "certain"))
+            elif _cancelled:
+                await self._notify_terminal_delivery(
+                    DeliveryResult(False, "uncertain", "cancelled")
+                )
+            elif _failed:
+                await self._notify_terminal_delivery(
+                    DeliveryResult(False, "uncertain", "stream_exception")
+                )
+            elif self._completion_enqueued:
+                await self._notify_terminal_delivery(
+                    DeliveryResult(False, "not_sent", "terminal_not_delivered")
+                )
 
     # Strip MEDIA:<path> tags before display. Uses the shared anchored
     # MEDIA_TAG_CLEANUP_RE from gateway/platforms/base.py — only tags whose

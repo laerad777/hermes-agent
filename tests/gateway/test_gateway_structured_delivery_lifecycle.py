@@ -1,9 +1,13 @@
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from gateway.platforms.base import BasePlatformAdapter, Platform, PlatformConfig, SendResult
+from gateway.platforms.base import (
+    BasePlatformAdapter, DeliveryResult, Platform, PlatformConfig, SendResult,
+    delivery_result_from_send,
+)
 
 
 _DETAILS = {
@@ -68,6 +72,19 @@ class _CancellationAdapter(_LifecycleAdapter):
         self.events.append(("send", content))
         self.send_started.set()
         await asyncio.Future()
+
+
+def test_terminal_send_results_have_explicit_success_failure_and_uncertainty():
+    assert delivery_result_from_send(
+        SendResult(True, delivery_certainty="delivered")
+    ) == DeliveryResult(True, "certain")
+    assert delivery_result_from_send(
+        SendResult(False, error_kind="rejected", delivery_certainty="not_sent")
+    ) == DeliveryResult(False, "not_sent", "rejected")
+    # A provider-shaped object is not evidence of success.
+    assert delivery_result_from_send(object()) == DeliveryResult(
+        False, "uncertain", "unknown"
+    )
 
 
 @pytest.mark.asyncio
@@ -145,3 +162,57 @@ async def test_cancellation_finalizes_pending_once_then_reraises():
         "begin", "attempt", "send", "finalize",
     ]
     assert adapter.events[-1] == ("finalize", "unknown")
+
+
+@pytest.mark.asyncio
+async def test_streamed_terminal_delivery_observes_one_typed_success_without_resend():
+    adapter = SimpleNamespace(
+        MAX_MESSAGE_LENGTH=4096,
+        REQUIRES_EDIT_FINALIZE=False,
+        send=AsyncMock(return_value=SendResult(True, message_id="final")),
+    )
+    observed = []
+    from gateway.stream_consumer import GatewayStreamConsumer
+
+    consumer = GatewayStreamConsumer(
+        adapter, "chat", on_terminal_delivery=observed.append,
+    )
+    task = asyncio.create_task(consumer.run())
+    consumer.complete("streamed response")
+    await task
+
+    assert adapter.send.await_count == 1
+    assert observed == [DeliveryResult(True, "certain")]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_stream_observes_one_typed_uncertain_outcome():
+    adapter = SimpleNamespace(MAX_MESSAGE_LENGTH=4096, REQUIRES_EDIT_FINALIZE=False)
+    observed = []
+    from gateway.stream_consumer import GatewayStreamConsumer
+
+    consumer = GatewayStreamConsumer(
+        adapter, "chat", on_terminal_delivery=observed.append,
+    )
+    task = asyncio.create_task(consumer.run())
+    await asyncio.sleep(0)
+    task.cancel()
+    await task
+
+    assert observed == [DeliveryResult(False, "uncertain", "cancelled")]
+
+
+@pytest.mark.asyncio
+async def test_stale_stream_early_return_does_not_read_uninitialized_terminal_state():
+    adapter = SimpleNamespace(MAX_MESSAGE_LENGTH=4096, REQUIRES_EDIT_FINALIZE=False)
+    observed = []
+    from gateway.stream_consumer import GatewayStreamConsumer
+
+    consumer = GatewayStreamConsumer(
+        adapter, "chat", on_terminal_delivery=observed.append,
+        run_still_current=lambda: False,
+    )
+
+    await consumer.run()
+
+    assert observed == []

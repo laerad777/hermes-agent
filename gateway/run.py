@@ -40,6 +40,7 @@ import sys
 import signal
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
@@ -2324,6 +2325,8 @@ from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.turn_context import TurnContext
 from gateway.platforms.base import (
     BasePlatformAdapter,
+    DeliveryResult,
+    delivery_result_from_send,
     EphemeralReply,
     MessageEvent,
     MessageType,
@@ -2449,6 +2452,74 @@ _CONVERSATION_SCOPED_STATE: tuple = (
 
 # Sentinel for "caller did not pass metadata" vs "caller passed None".
 _UNSET = object()
+
+
+def _observer_scalar(value: Any, limit: int = 128) -> str:
+    """Return a bounded scalar suitable for observer lifecycle payloads."""
+    if value is None:
+        return ""
+    return str(value).replace("\n", " ").replace("\r", " ")[:limit]
+
+
+_OBSERVER_EVENT_IDS = frozenset({
+    "turn_id", "session_id", "lineage_parent_session_id", "previous_session_id",
+    "old_session_id", "new_session_id", "delivery_id", "message_id", "chat_id",
+    "thread_id", "parent_chat_id", "profile", "route_profile", "platform", "chat_type",
+})
+_MAX_TURN_CONTEXT_CONTRIBUTIONS = 8
+_MAX_TURN_CONTEXT_BYTES = 4096
+
+
+def _observer_event_payload(*, session_key: str, run_generation: Optional[int],
+                            turn_id: str, event_kind: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Build a bounded observer event without changing typed lifecycle values."""
+    forbidden = {"prompt", "response", "body", "token", "tokens", "metadata", "private_metadata"}
+    event = {
+        name: (_observer_scalar(value) if name in _OBSERVER_EVENT_IDS else value)
+        for name, value in payload.items() if name not in forbidden
+    }
+    event.update({
+        "event_id": str(uuid.uuid4()),
+        "session_key": _observer_scalar(session_key),
+        "run_generation": int(run_generation or 0),
+        "turn_id": _observer_scalar(turn_id),
+        "event_kind": _observer_scalar(event_kind),
+    })
+    if event_kind == "delivery_result":
+        event.setdefault("delivery_id", _stable_delivery_id(session_key, run_generation, turn_id))
+    return event
+
+
+def _stable_delivery_id(session_key: str, run_generation: Optional[int], turn_id: str) -> str:
+    """Return the stable id for one logical terminal delivery."""
+    return str(uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"gateway-delivery:{_observer_scalar(session_key)}:{int(run_generation or 0)}:{_observer_scalar(turn_id)}",
+    ))
+
+
+def _observer_context_notes(results: Any) -> list[str]:
+    """Accept only bounded, turn-local context contributions from observers."""
+    notes: list[str] = []
+    for result in results if isinstance(results, list) else []:
+        context = result.get("context") if isinstance(result, dict) else result
+        if not isinstance(context, str):
+            continue
+        context = context.strip()
+        if context:
+            notes.append(context[:_MAX_TURN_CONTEXT_BYTES])
+        if len(notes) == _MAX_TURN_CONTEXT_CONTRIBUTIONS:
+            break
+    return notes
+
+
+def _delivery_observer_outcome(result: Any) -> tuple[bool, str, str]:
+    """Accept only typed delivery outcomes; arbitrary values are uncertain."""
+    if not isinstance(result, DeliveryResult):
+        return False, "uncertain", "unknown"
+    if result.certainty not in {"certain", "uncertain", "not_sent"}:
+        return False, "uncertain", "unknown"
+    return result.success, result.certainty, result.failure_category
 
 
 def _resolve_runtime_agent_kwargs() -> dict:
@@ -4442,6 +4513,10 @@ class TurnRunner:
                             on_missing_cursor="raise",
                         )
                     )
+                    _stream_lineage_parent = getattr(
+                        self._runner._get_cached_session_entry(ctx.session_key),
+                        "prev_session_id", None,
+                    )
                     _stream_consumer = GatewayStreamConsumer(
                         adapter=_adapter,
                         chat_id=ctx.source.chat_id,
@@ -4453,6 +4528,21 @@ class TurnRunner:
                             else None
                         ),
                         on_before_finalize=_pause_typing_before_finalize,
+                        on_terminal_delivery=lambda delivery_result: (
+                            self._runner._observe_delivery_result(
+                                delivery_result,
+                                source=ctx.source,
+                                session_key=ctx.session_key,
+                                run_generation=ctx.run_generation,
+                                turn_id=_observer_scalar(ctx.event_message_id or ctx.session_key),
+                                delivery_id=_stable_delivery_id(
+                                    ctx.session_key, ctx.run_generation,
+                                    _observer_scalar(ctx.event_message_id or ctx.session_key),
+                                ),
+                                session_id=ctx.session_id,
+                                lineage_parent_session_id=_stream_lineage_parent,
+                            )
+                        ),
                         initial_reply_to_id=ctx.event_message_id,
                         run_still_current=ctx._run_still_current,
                         filter_discord_product_details=(
@@ -5966,6 +6056,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # cannot grow unbounded over a long-running gateway lifetime.
         self._session_sources: "OrderedDict[str, SessionSource]" = OrderedDict()
         self._session_sources_max = 512
+        # Terminal delivery observers must use the persisted session lineage,
+        # never mutable transport provenance carried by SessionSource.
+        self._session_entries: "OrderedDict[str, SessionEntry]" = OrderedDict()
+        self._session_entries_max = 512
         # Completion delivery is intentionally lifecycle-scoped. This closes
         # duplicate queue/watcher races inside one gateway without pretending
         # the adapter call and a persistence write can be exactly-once across
@@ -16052,6 +16146,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
+    def _cache_session_entry(self, session_key: str, session_entry: SessionEntry) -> None:
+        """Retain bounded authoritative lineage for terminal delivery observers."""
+        if not session_key or session_entry is None:
+            return
+        entries = getattr(self, "_session_entries", None)
+        if entries is None:
+            entries = OrderedDict()
+            self._session_entries = entries
+        entries[session_key] = session_entry
+        try:
+            entries.move_to_end(session_key)
+            while len(entries) > getattr(self, "_session_entries_max", 512):
+                entries.popitem(last=False)
+        except Exception:
+            pass
+
+    def _get_cached_session_entry(self, session_key: str) -> Optional[SessionEntry]:
+        entries = getattr(self, "_session_entries", None)
+        if not entries:
+            return None
+        entry = entries.get(session_key)
+        if entry is not None:
+            try:
+                entries.move_to_end(session_key)
+            except Exception:
+                pass
+        return entry
+
     @property
     def async_session_store(self) -> AsyncSessionStore:
         """Return the single async facade for this runner's SessionStore."""
@@ -16118,6 +16240,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return
             session_entry = resolved_entry
         self._cache_session_source(session_key, source)
+        self._cache_session_entry(session_key, session_entry)
         if await asyncio.to_thread(self._is_telegram_topic_lane, source):
             try:
                 binding = (await self._session_db.get_telegram_topic_binding(
@@ -16194,6 +16317,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # compaction summaries. Mirrors /reset and the compression-exhausted
             # path (#9893). Covers daily/idle/suspended auto-reset.
             self._evict_cached_agent(session_key)
+            self._emit_observer_hook_once(
+                "on_session_boundary",
+                session_key=session_key,
+                run_generation=run_generation,
+                turn_id=f"auto-reset:{run_generation}",
+                event_kind="session_boundary",
+                boundary="automatic_reset",
+                new_session_id=session_entry.session_id,
+                lineage_parent_session_id=getattr(session_entry, "prev_session_id", None),
+                platform=getattr(getattr(source, "platform", None), "value", ""),
+                profile=getattr(source, "profile", None),
+                route_profile=getattr(source, "profile", None),
+                chat_id=getattr(source, "chat_id", None),
+                chat_type=getattr(source, "chat_type", None),
+                thread_id=getattr(source, "thread_id", None),
+                parent_chat_id=getattr(source, "parent_chat_id", None),
+            )
             session_entry.was_auto_reset = False
         
         # Emit session:start for new or auto-reset sessions
@@ -17276,13 +17416,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as _ts_err:
             logger.debug("Message timestamp injection failed (non-fatal): %s", _ts_err)
 
-        # Stage the collected must-deliver notes for this turn's agent run
-        # (one-shot; consumed in run_sync).  Staged AFTER the message_text
-        # early-out above so an aborted turn cannot leak its notes into the
-        # next turn's user message.
-        if turn_sidecar_notes and session_key:
-            self._set_pending_turn_sidecar_notes(session_key, turn_sidecar_notes)
-
         # Bind this gateway run generation to the adapter's active-session
         # event so deferred post-delivery callbacks can be released by the
         # same run that registered them.
@@ -17291,6 +17424,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_key,
             run_generation,
         )
+
+        _origin_kind = "normal"
+        if getattr(event, "internal", False):
+            _origin_kind = "internal_handoff"
+        elif getattr(event, "_hermes_startup_restore_replay", False) or getattr(session_entry, "resume_pending", False):
+            _origin_kind = "resume"
+        elif history and isinstance(history[-1], dict) and history[-1].get("role") == "tool":
+            _origin_kind = "leftover_drain"
+        _origin_turn_id = _observer_scalar(
+            getattr(event, "message_id", None) or f"generation:{run_generation}"
+        )
+        _origin_results = self._emit_observer_hook_once(
+            "on_agent_turn_origin",
+            session_key=session_key,
+            run_generation=run_generation,
+            turn_id=_origin_turn_id,
+            event_kind="agent_turn_origin",
+            origin=_origin_kind,
+            session_id=session_entry.session_id,
+            lineage_parent_session_id=getattr(session_entry, "prev_session_id", None),
+            platform=getattr(getattr(source, "platform", None), "value", ""),
+            profile=getattr(source, "profile", None),
+            route_profile=getattr(source, "profile", None),
+            chat_id=getattr(source, "chat_id", None),
+            chat_type=getattr(source, "chat_type", None),
+            thread_id=getattr(source, "thread_id", None),
+            parent_chat_id=getattr(source, "parent_chat_id", None),
+        )
+        # Observer context is a one-shot api_content sidecar contribution.
+        # It is deliberately staged only after the current message survived
+        # preparation, and never enters history or the system prompt.
+        turn_sidecar_notes.extend(_observer_context_notes(_origin_results))
+        if turn_sidecar_notes and session_key:
+            self._set_pending_turn_sidecar_notes(session_key, turn_sidecar_notes)
 
         try:
             # Emit agent:start hook
@@ -22722,6 +22889,87 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         current = state.persistent.run_generation if state is not None else 0
         return int(current) == int(generation)
 
+    def _emit_observer_hook_once(self, hook_name: str, *, session_key: str,
+                                 run_generation: Optional[int], turn_id: str,
+                                 event_kind: str, **payload: Any) -> list[Any]:
+        """Fire an observer hook once per deterministic in-process event key."""
+        delivery_id = None
+        if event_kind == "delivery_result":
+            delivery_id = str(payload.get("delivery_id") or _stable_delivery_id(
+                session_key, run_generation, turn_id,
+            ))
+            payload["delivery_id"] = delivery_id
+        key = (session_key, int(run_generation or 0), turn_id, event_kind, delivery_id)
+        if event_kind == "delivery_result":
+            delivered = getattr(self, "_observer_delivery_ids", None)
+            if delivered is None:
+                delivered = set()
+                self._observer_delivery_ids = delivered
+            if delivery_id in delivered:
+                return []
+            # Terminal IDs remain deduplicated for the runner lifetime.
+            delivered.add(delivery_id)
+        emitted = getattr(self, "_observer_hook_events", None)
+        if emitted is None:
+            emitted = OrderedDict()
+            self._observer_hook_events = emitted
+        if key in emitted:
+            return []
+        emitted[key] = None
+        safe_payload = _observer_event_payload(
+            session_key=session_key, run_generation=run_generation, turn_id=turn_id,
+            event_kind=event_kind, payload=payload,
+        )
+        try:
+            from hermes_cli.lifecycle import invoke_hook
+            return invoke_hook(hook_name, **safe_payload)
+        except Exception:
+            logger.warning("Observer hook %s invocation failed", hook_name, exc_info=True)
+            return []
+
+    def _observe_delivery_result(
+        self,
+        result: DeliveryResult,
+        *,
+        source: Any,
+        session_key: str,
+        run_generation: Optional[int],
+        turn_id: str,
+        delivery_id: str,
+        session_id: Optional[str] = None,
+        lineage_parent_session_id: Optional[str] = None,
+    ) -> None:
+        """Emit the single typed observer contract for terminal adapter sends."""
+        success, certainty, failure_category = _delivery_observer_outcome(result)
+        session_entry = self._get_cached_session_entry(session_key)
+        stable_delivery_id = delivery_id or _stable_delivery_id(
+            session_key, run_generation, turn_id,
+        )
+        self._emit_observer_hook_once(
+            "on_delivery_result",
+            session_key=session_key,
+            run_generation=run_generation,
+            turn_id=turn_id,
+            event_kind="delivery_result",
+            success=success,
+            certainty=certainty,
+            failure_category=failure_category,
+            delivery_id=stable_delivery_id,
+            session_id=session_id or getattr(session_entry, "session_id", None) or session_key,
+            lineage_parent_session_id=(
+                lineage_parent_session_id
+                if lineage_parent_session_id is not None
+                else getattr(session_entry, "prev_session_id", None)
+            ),
+            platform=getattr(getattr(source, "platform", None), "value", ""),
+            profile=getattr(source, "profile", None),
+            route_profile=getattr(source, "profile", None),
+            chat_id=getattr(source, "chat_id", None),
+            chat_type=getattr(source, "chat_type", None),
+            thread_id=getattr(source, "thread_id", None),
+            parent_chat_id=getattr(source, "parent_chat_id", None),
+        )
+
     def _bind_adapter_run_generation(
         self,
         adapter: Any,
@@ -23629,12 +23877,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             on_missing_cursor="fallback",
                         )
                     )
+                    _stream_lineage_parent = getattr(
+                        self._get_cached_session_entry(session_key),
+                        "prev_session_id", None,
+                    )
                     _stream_consumer = GatewayStreamConsumer(
                         adapter=_adapter,
                         chat_id=source.chat_id,
                         config=_consumer_cfg,
                         metadata=_thread_metadata,
                         on_before_finalize=_pause_typing_before_finalize,
+                        on_terminal_delivery=lambda delivery_result: (
+                            self._observe_delivery_result(
+                                delivery_result,
+                                source=source,
+                                session_key=session_key,
+                                run_generation=run_generation,
+                                turn_id=_observer_scalar(event_message_id or session_key),
+                                delivery_id=_stable_delivery_id(
+                                    session_key, run_generation,
+                                    _observer_scalar(event_message_id or session_key),
+                                ),
+                                session_id=session_id,
+                                lineage_parent_session_id=_stream_lineage_parent,
+                            )
+                        ),
                         initial_reply_to_id=event_message_id,
                         run_still_current=_run_still_current,
                         filter_discord_product_details=(
@@ -25370,19 +25637,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     _queued_metadata, _queued_delivery_metadata
                                 )
                                 _final_adapter = adapter._final_delivery_adapter(source)
-                                await _final_adapter._send_with_retry(
+                                _queued_send_result = await _final_adapter._send_with_retry(
                                     source.chat_id,
                                     first_response,
                                     metadata=_queued_metadata,
                                 )
                             else:
-                                await adapter.send(
+                                _queued_send_result = await adapter.send(
                                     source.chat_id,
                                     first_response,
                                     metadata=_status_thread_metadata,
                                 )
+                            self._observe_delivery_result(
+                                delivery_result_from_send(_queued_send_result),
+                                source=source,
+                                session_key=session_key,
+                                run_generation=run_generation,
+                                turn_id=_observer_scalar(event_message_id or f"queued:{_interrupt_depth}"),
+                                delivery_id=_stable_delivery_id(
+                                    session_key, run_generation,
+                                    _observer_scalar(event_message_id or f"queued:{_interrupt_depth}"),
+                                ),
+                            )
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)
+                            self._observe_delivery_result(
+                                DeliveryResult(False, "uncertain", "transport_exception"),
+                                source=source,
+                                session_key=session_key,
+                                run_generation=run_generation,
+                                turn_id=_observer_scalar(event_message_id or f"queued:{_interrupt_depth}"),
+                                delivery_id=_stable_delivery_id(
+                                    session_key, run_generation,
+                                    _observer_scalar(event_message_id or f"queued:{_interrupt_depth}"),
+                                ),
+                            )
                     elif first_response:
                         logger.info(
                             "Queued follow-up for session %s: skipping resend because final streamed delivery was confirmed.",
@@ -25501,6 +25790,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # recursive call runs under so the snapshot matches exactly
                 # what the follow-up's guard will consult.  Fail-safe in helper.
                 await self._refresh_agent_cache_message_count(session_key, session_id)
+
+                # A queued/interrupt origin is a continuity edge, not an
+                # ordinary turn.  Its IDs must come from the cached session
+                # entry that owns the new run, never from the completed turn.
+                _queued_session_entry = self._get_cached_session_entry(next_session_key)
+                _queued_origin_results = self._emit_observer_hook_once(
+                    "on_agent_turn_origin",
+                    session_key=next_session_key,
+                    run_generation=run_generation,
+                    turn_id=_observer_scalar(next_message_id or f"queued:{_interrupt_depth + 1}"),
+                    event_kind="agent_turn_origin",
+                    origin="interrupt" if was_interrupted else "queued",
+                    session_id=(
+                        getattr(_queued_session_entry, "session_id", None)
+                        or session_id
+                    ),
+                    lineage_parent_session_id=getattr(
+                        _queued_session_entry, "prev_session_id", None,
+                    ),
+                    platform=getattr(getattr(next_source, "platform", None), "value", ""),
+                    profile=getattr(next_source, "profile", None),
+                    route_profile=getattr(next_source, "profile", None),
+                    chat_id=getattr(next_source, "chat_id", None),
+                    chat_type=getattr(next_source, "chat_type", None),
+                    thread_id=getattr(next_source, "thread_id", None),
+                    parent_chat_id=getattr(next_source, "parent_chat_id", None),
+                )
+                _queued_origin_notes = _observer_context_notes(_queued_origin_results)
+                if _queued_origin_notes and next_session_key:
+                    self._set_pending_turn_sidecar_notes(next_session_key, _queued_origin_notes)
 
                 followup_result = await self._run_agent(
                     message=next_message,

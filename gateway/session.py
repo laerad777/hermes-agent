@@ -2911,6 +2911,7 @@ class SessionStore:
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,
                 is_fresh_reset=True,
+                prev_session_id=old_entry.session_id,
             )
 
             self._entries[session_key] = new_entry

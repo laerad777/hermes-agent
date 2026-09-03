@@ -314,6 +314,32 @@ class GatewaySlashCommandsMixin:
         except Exception:
             pass
 
+        # Generic observer boundary: unlike the legacy reset hook this carries
+        # only bounded routing/session identity scalars and is isolated from
+        # the command outcome.
+        try:
+            _generation = self._session_state(session_key).persistent.run_generation
+            self._emit_observer_hook_once(
+                "on_session_boundary",
+                session_key=session_key,
+                run_generation=_generation,
+                turn_id=f"reset:{_generation}",
+                event_kind="session_boundary",
+                boundary="explicit_reset",
+                old_session_id=_old_sid,
+                new_session_id=_new_sid,
+                lineage_parent_session_id=getattr(new_entry, "prev_session_id", None),
+                platform=getattr(getattr(source, "platform", None), "value", ""),
+                profile=getattr(source, "profile", None),
+                route_profile=getattr(source, "profile", None),
+                chat_id=getattr(source, "chat_id", None),
+                chat_type=getattr(source, "chat_type", None),
+                thread_id=getattr(source, "thread_id", None),
+                parent_chat_id=getattr(source, "parent_chat_id", None),
+            )
+        except Exception:
+            logger.warning("Session-boundary observer invocation failed", exc_info=True)
+
         # Append a random tip to the reset message
         try:
             from hermes_cli.tips import get_random_tip

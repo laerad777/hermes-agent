@@ -557,7 +557,7 @@ import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Callable, Awaitable, Tuple, Union
+from typing import Dict, List, Optional, Any, Callable, Awaitable, Tuple, Union, Literal
 from enum import Enum
 
 from pathlib import Path as _Path
@@ -2250,6 +2250,32 @@ class SendResult:
     # only retry when an adapter proves no platform request was made.
     delivery_certainty: Optional[str] = None
     structured_failure: Optional[str] = None
+
+
+DeliveryCertainty = Literal["certain", "uncertain", "not_sent"]
+
+
+@dataclass(frozen=True)
+class DeliveryResult:
+    """Typed terminal delivery observation independent of adapter internals."""
+
+    success: bool
+    certainty: DeliveryCertainty
+    failure_category: str = ""
+
+
+def delivery_result_from_send(result: Any) -> DeliveryResult:
+    """Convert only a declared SendResult; unknown transport values stay uncertain."""
+    if not isinstance(result, SendResult):
+        return DeliveryResult(False, "uncertain", "unknown")
+    if result.success:
+        return DeliveryResult(True, "certain", "")
+    certainty = result.delivery_certainty or "unknown"
+    if certainty == "delivered":
+        certainty = "certain"
+    elif certainty not in {"not_sent", "certain"}:
+        certainty = "uncertain"
+    return DeliveryResult(False, certainty, result.error_kind or "transport_failed")
 
 
 class _GatewayDeliveryResponse(str):
@@ -4057,7 +4083,7 @@ class BasePlatformAdapter(ABC):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+    ) -> list[SendResult]:
         """Send a batch of images.
 
         Accepts ``http(s)://``, ``file://`` URIs in the first tuple
@@ -4072,6 +4098,7 @@ class BasePlatformAdapter(ABC):
         """
         from urllib.parse import unquote as _unquote
 
+        results: list[SendResult] = []
         for image_url, alt_text in images:
             if human_delay > 0:
                 await asyncio.sleep(human_delay)
@@ -4103,10 +4130,12 @@ class BasePlatformAdapter(ABC):
                         caption=alt_text if alt_text else None,
                         metadata=metadata,
                     )
+                results.append(img_result)
                 if not img_result.success:
                     logger.error("[%s] Failed to send image: %s", self.name, img_result.error)
             except Exception as img_err:
                 logger.error("[%s] Error sending image: %s", self.name, img_err, exc_info=True)
+        return results
 
     async def send_image(
         self,
@@ -5177,6 +5206,32 @@ class BasePlatformAdapter(ABC):
         ):
             return self
         return live_adapter
+
+    def _observe_terminal_delivery(
+        self,
+        event: "MessageEvent",
+        session_key: str,
+        result: Any,
+        *,
+        delivery_id: str | None = None,
+    ) -> None:
+        """Send every final adapter outcome through the runner's typed funnel."""
+        runner = getattr(self, "gateway_runner", None)
+        observe = getattr(runner, "_observe_delivery_result", None)
+        if not callable(observe):
+            return
+        active = getattr(self, "_active_sessions", {}).get(session_key)
+        try:
+            observe(
+                delivery_result_from_send(result),
+                source=event.source,
+                session_key=session_key,
+                run_generation=getattr(active, "_hermes_run_generation", None),
+                turn_id=str(getattr(event, "message_id", "") or session_key),
+                delivery_id=delivery_id or str(uuid.uuid4()),
+            )
+        except Exception:
+            logger.warning("[%s] Delivery observer failed", self.name, exc_info=True)
 
     async def _send_with_retry(
         self,
@@ -6318,6 +6373,7 @@ class BasePlatformAdapter(ABC):
                             caption=telegram_tts_caption,
                             metadata=_final_thread_metadata,
                         )
+                        self._observe_terminal_delivery(event, session_key, tts_result)
                         _tts_caption_delivered = bool(
                             telegram_tts_caption and getattr(tts_result, "success", False)
                         )
@@ -6406,6 +6462,7 @@ class BasePlatformAdapter(ABC):
                         reply_to=_reply_anchor,
                         metadata=_final_thread_metadata,
                     )
+                    self._observe_terminal_delivery(event, session_key, result)
                     _record_delivery(result)
                     if _obligation_id is not None:
                         try:
@@ -6447,13 +6504,16 @@ class BasePlatformAdapter(ABC):
                 if images:
                     logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(images))
                     try:
-                        await self.send_multiple_images(
+                        _image_results = await self.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=images,
                             metadata=_final_thread_metadata,
                             human_delay=human_delay,
                         )
+                        for _image_result in _image_results or [None]:
+                            self._observe_terminal_delivery(event, session_key, _image_result)
                     except Exception as batch_err:
+                        self._observe_terminal_delivery(event, session_key, None)
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
 
 
@@ -6489,13 +6549,16 @@ class BasePlatformAdapter(ABC):
                 if _image_paths:
                     try:
                         _batch = [(f"file://{_quote(p)}", "") for p in _image_paths]
-                        await self.send_multiple_images(
+                        _image_results = await self.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=_batch,
                             metadata=_final_thread_metadata,
                             human_delay=human_delay,
                         )
+                        for _image_result in _image_results or [None]:
+                            self._observe_terminal_delivery(event, session_key, _image_result)
                     except Exception as batch_err:
+                        self._observe_terminal_delivery(event, session_key, None)
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
 
                 if _non_image_media:
@@ -6534,6 +6597,7 @@ class BasePlatformAdapter(ABC):
                                 metadata=_final_thread_metadata,
                             )
 
+                        self._observe_terminal_delivery(event, session_key, media_result)
                         if not media_result.success:
                             logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, media_result.error)
                             await self._notify_media_delivery_failure(
@@ -6543,6 +6607,7 @@ class BasePlatformAdapter(ABC):
                                 metadata=_final_thread_metadata,
                             )
                     except Exception as media_err:
+                        self._observe_terminal_delivery(event, session_key, None)
                         logger.warning("[%s] Error sending media: %s", self.name, media_err)
 
                 # Send auto-detected local non-image files as native attachments
@@ -6563,6 +6628,7 @@ class BasePlatformAdapter(ABC):
                                 file_path=file_path,
                                 metadata=_final_thread_metadata,
                             )
+                        self._observe_terminal_delivery(event, session_key, file_result)
                         if not file_result.success:
                             logger.warning(
                                 "[%s] Failed to send local file (%s): %s",
@@ -6576,6 +6642,7 @@ class BasePlatformAdapter(ABC):
                                 metadata=_final_thread_metadata,
                             )
                     except Exception as file_err:
+                        self._observe_terminal_delivery(event, session_key, None)
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
 
                 # A3 (#29346): if a non-empty response produced nothing

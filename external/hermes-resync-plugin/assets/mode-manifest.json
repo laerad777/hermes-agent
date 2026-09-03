@@ -1,0 +1,14 @@
+{
+  "assets": [
+    {
+      "path": "comfyui_setup.sh",
+      "mode": "0755",
+      "sha256": "b914c931efb66dfbe6f1f9140b329db7fee7ab3a4f9931427a06d8a45c8886fd"
+    },
+    {
+      "path": "himalaya_preflight.md",
+      "mode": "0644",
+      "sha256": "d7b0912b83c4454fa9267f56a116275a1d1f86605089b3b98d158402d6706452"
+    }
+  ]
+}

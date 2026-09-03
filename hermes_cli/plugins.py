@@ -161,6 +161,11 @@ VALID_HOOKS: Set[str] = {
     "on_session_end",
     "on_session_finalize",
     "on_session_reset",
+    # Gateway observer lifecycle hooks. These receive bounded scalar metadata
+    # only and cannot affect turn execution or message delivery.
+    "on_agent_turn_origin",
+    "on_session_boundary",
+    "on_delivery_result",
     "subagent_start",
     "subagent_stop",
     # Gateway pre-dispatch hook. Fired once per incoming MessageEvent

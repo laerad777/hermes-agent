@@ -242,7 +242,7 @@ class TestSessionOps:
             capabilities=False,
             refresh=False,
             probe_custom_providers=False,
-            probe_current_custom_provider=False,
+            probe_current_custom_provider=True,
             max_models=ACP_MAX_MODELS_PER_PROVIDER,
         )
 
